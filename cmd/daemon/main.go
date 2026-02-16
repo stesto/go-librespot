@@ -114,7 +114,7 @@ func NewApp(cfg *Config) (app *App, err error) {
 	if cfg.FlacEnabled && !playplay.Plugin.IsSupported() {
 		// FLAC decryption keys are available only with the PlayPlay DRM implementation.
 		// Using PlayPlay might get you banned by Spotify.
-		return nil, fmt.Errorf("FLAC playback requires a PlapPlay implementation")
+		return nil, fmt.Errorf("FLAC playback requires a PlayPlay implementation")
 	}
 
 	return app, nil
@@ -127,6 +127,13 @@ func (app *App) newAppPlayer(ctx context.Context, creds any) (_ *AppPlayer, err 
 		logout:       app.logoutCh,
 		countryCode:  new(string),
 		volumeUpdate: make(chan float32, 1),
+
+		tcpVolClient:   NewTCPVolumeClient(app.cfg.VolumeTCP.Enabled, app.cfg.VolumeTCP.ServiceAdress, app.cfg.VolumeTCP.ServicePort),
+		tcpVolListener: NewTCPVolumeListener(app.cfg.VolumeTCP.Enabled, app.cfg.VolumeTCP.Address, app.cfg.VolumeTCP.Port),
+	}
+
+	if appPlayer.tcpVolListener != nil {
+		appPlayer.tcpVolListener.Start(app.log)
 	}
 
 	appPlayer.prefetchTimer = time.NewTimer(math.MaxInt64)
@@ -438,6 +445,13 @@ type Config struct {
 			PersistCredentials bool `koanf:"persist_credentials"`
 		} `koanf:"zeroconf"`
 	} `koanf:"credentials"`
+	VolumeTCP struct {
+		Enabled       bool   `koanf:"enabled"`
+		Address       string `koanf:"address"`
+		Port          int    `koanf:"port"`
+		ServiceAdress string `koanf:"service_address"`
+		ServicePort   int    `koanf:"service_port"`
+	} `koanf:"volume_over_tcp"`
 }
 
 func loadConfig(cfg *Config) error {
@@ -501,6 +515,8 @@ func loadConfig(cfg *Config) error {
 
 		"server.address":    "localhost",
 		"server.image_size": "default",
+
+		"volume_over_tcp.address": "localhost",
 	}, "."), nil)
 
 	// load file configuration (if available)

@@ -295,6 +295,36 @@
           "type": "boolean",
           "description": "Whether FLAC files should be preferred over other formats when available",
           "default": false
+        },
+        "volume_over_tcp": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Whether the volume should be handled externally. Set external_volume to true to disable librespots internal volume",
+              "default": false
+            },
+            "address": {
+              "type": "string",
+              "description": "Which address to bind for the volume server",
+              "default": "localhost"
+            },
+            "port": {
+              "type": "integer",
+              "description": "Which port to bind for the volume server",
+              "default": 0
+            },
+            "service_address": {
+              "type": "string",
+              "description": "Which address to connect to for getting and setting the volume",
+              "default": ""
+            },
+            "service_port": {
+              "type": "integer",
+              "description": "Which port to connect to for getting and setting the volume",
+              "default": 0
+            }
+          }
         }
       },
       "required": [

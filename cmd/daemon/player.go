@@ -49,6 +49,9 @@ type AppPlayer struct {
 	secondaryStream *player.Stream
 
 	prefetchTimer *time.Timer
+
+	tcpVolClient   *TCPVolumeClient
+	tcpVolListener *TCPVolumeListener
 }
 
 func (p *AppPlayer) handleAccesspointPacket(pktType ap.PacketType, payload []byte) error {
@@ -81,6 +84,18 @@ func (p *AppPlayer) handleDealerMessage(ctx context.Context, msg dealer.Message)
 	if strings.HasPrefix(msg.Uri, "hm://pusher/v1/connections/") {
 		p.spotConnId = msg.Headers["Spotify-Connection-Id"]
 		p.app.log.Debugf("received connection id: %s...%s", p.spotConnId[:16], p.spotConnId[len(p.spotConnId)-16:])
+
+		initVol := p.app.cfg.InitialVolume * player.MaxStateVolume / p.app.cfg.VolumeSteps
+		if p.tcpVolClient != nil {
+			if v, ok := p.tcpVolClient.GetVolume(300 * time.Millisecond); ok {
+				initVol = v
+				p.app.log.Debugf("fetched external volume once: %s", v)
+			}
+		}
+		if initVol > player.MaxStateVolume {
+			initVol = player.MaxStateVolume
+		}
+		p.state.device.Volume = initVol
 
 		// put the initial state
 		if err := p.putConnectState(ctx, connectpb.PutStateReason_NEW_DEVICE); err != nil {
@@ -727,7 +742,18 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest, mprisRec
 			// limit them (otherwise we get HTTP error 429: Too many requests
 			// for user).
 			p.state.device.Volume = uint32(math.Round(float64(volume * player.MaxStateVolume)))
+			// publish to external service, if configured
+			if p.tcpVolClient != nil {
+				p.tcpVolClient.SetVolume(p.state.device.Volume, 200*time.Millisecond)
+			}
 			volumeTimer.Reset(100 * time.Millisecond)
+		case volume := <-p.tcpVolListener.vol:
+			// External service pushed a new volume to our listener.
+			// Update Connect state volume, publish to Spotify (debounced), no websocket emit.
+			if p.state.device.Volume != volume {
+				p.state.device.Volume = volume
+				volumeTimer.Reset(100 * time.Millisecond)
+			}
 		case <-volumeTimer.C:
 			// We've gone some time without update, send the new value now.
 			p.volumeUpdated(ctx)

@@ -192,6 +192,29 @@ The pregain is applied on Spotify's -14 dB LUFS target. Spotify suggests the fol
 - Normal: -14 dB LUFS, apply a pregain of 0 dB
 - Quiet: -19 dB LUFS, apply a pregain of -5 dB
 
+### Handling volume externally
+
+To sync the go-librespot volume over TCP to an external service, which can be useful if you control your main volume externally, the following options can be used:
+````yaml
+external_volume: true # disables librespots internal volume
+volume_over_tcp:
+  enabled: true
+  address: localhost # Which address to bind the volume listener to
+  port: 3679 # The port for the volume listener
+  service_address: localhost # Which address to connect to for getting and setting the volume
+  service_port: 55550 # Which port to connect to for getting and setting the volume
+````
+
+When enabled, librespot will connect to the given service address and port everytime it needs to know the current volume or set a new volume (which happens when the user changed it through the Spotify UI).
+
+Your service needs to set up a TCP server listening on your configured `service_address` and `service_port`.
+
+When requesting your current external volume, librespot connects to your service, sends exactly 1 byte with the value `0x00`, waits for the response of exactly one byte with your external volume mapped from `0..255` and destroys the connection.
+
+When setting the volume, librespot connects to your service, sends exactly 2 bytes with the first byte being `0x01` and the second byte being the new volume mapped from `0..255` and destroys the connection.
+
+When your service wants to notify librespot (and the users UI) that the volume has changed externally, your service can connect to the configured `address` and `port`, send exactly 1 byte with the volume mapped from `0..255` and destroy the connection.
+
 ### Additional configuration
 
 The following options are also available:
