@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"sync"
 	"time"
 
@@ -27,8 +28,7 @@ type KeyProvider struct {
 
 	recvLoopOnce sync.Once
 
-	reqChan  chan keyRequest
-	stopChan chan struct{}
+	reqChan chan keyRequest
 }
 
 type keyRequest struct {
@@ -45,7 +45,6 @@ type keyResponse struct {
 func NewAudioKeyProvider(log librespot.Logger, ap *ap.Accesspoint) *KeyProvider {
 	p := &KeyProvider{log: log, ap: ap}
 	p.reqChan = make(chan keyRequest)
-	p.stopChan = make(chan struct{}, 1)
 	return p
 }
 
@@ -55,16 +54,20 @@ func (p *KeyProvider) startReceiving() {
 
 func (p *KeyProvider) recvLoop() {
 	ch := p.ap.Receive(ap.PacketTypeAesKey, ap.PacketTypeAesKeyError)
+	done := p.ap.Done()
 
 	seq := uint32(0)
 	reqs := map[uint32]keyRequest{}
 
 	for {
 		select {
-		case <-p.stopChan:
-			p.stopChan <- struct{}{}
+		case <-done:
 			return
-		case pkt := <-ch:
+		case pkt, ok := <-ch:
+			if !ok {
+				return
+			}
+
 			resp := bytes.NewReader(pkt.Payload)
 			var respSeq uint32
 			_ = binary.Read(resp, binary.BigEndian, &respSeq)
@@ -80,7 +83,10 @@ func (p *KeyProvider) recvLoop() {
 			switch pkt.Type {
 			case ap.PacketTypeAesKey:
 				key := make([]byte, 16)
-				_, _ = resp.Read(key)
+				if _, err := io.ReadFull(resp, key); err != nil {
+					req.resp <- keyResponse{err: fmt.Errorf("malformed aes key response for sequence %d: %w", respSeq, err)}
+					continue
+				}
 				req.resp <- keyResponse{key: key}
 			case ap.PacketTypeAesKeyError:
 				var errCode uint16
@@ -101,7 +107,11 @@ func (p *KeyProvider) recvLoop() {
 
 			reqs[reqSeq] = req
 
-			if err := p.ap.Send(context.TODO(), ap.PacketTypeRequestKey, buf.Bytes()); err != nil {
+			// Background on purpose: this pump writes for every queued request,
+			// so one caller's cancellation must not abort the others. Request
+			// applies the caller's deadline to the response wait instead, and
+			// Send already fails once the accesspoint is closed.
+			if err := p.ap.Send(context.Background(), ap.PacketTypeRequestKey, buf.Bytes()); err != nil {
 				delete(reqs, reqSeq)
 				req.resp <- keyResponse{err: fmt.Errorf("failed sending key request for file %s, gid: %s: %w",
 					hex.EncodeToString(req.fileId), librespot.GidToBase62(req.gid), err)}
@@ -114,27 +124,32 @@ func (p *KeyProvider) recvLoop() {
 }
 
 func (p *KeyProvider) Request(ctx context.Context, gid []byte, fileId []byte) ([]byte, error) {
+	done := p.ap.Done()
+
 	p.startReceiving()
 
 	req := keyRequest{gid: gid, fileId: fileId, resp: make(chan keyResponse, 1)}
-	p.reqChan <- req
+	select {
+	case <-done:
+		return nil, ap.ErrAccesspointClosed
+	case p.reqChan <- req:
+	}
 
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
+	var resp keyResponse
 	select {
+	case resp = <-req.resp:
 	case <-ctx.Done():
-		return nil, context.DeadlineExceeded
-	case resp := <-req.resp:
-		if resp.err != nil {
-			return nil, resp.err
-		}
-
-		return resp.key, nil
+		return nil, ctx.Err()
+	case <-done:
+		return nil, ap.ErrAccesspointClosed
 	}
-}
 
-func (p *KeyProvider) Close() {
-	p.stopChan <- struct{}{}
-	<-p.stopChan
+	if resp.err != nil {
+		return nil, resp.err
+	}
+
+	return resp.key, nil
 }

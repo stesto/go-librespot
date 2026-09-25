@@ -28,7 +28,13 @@ func newPulseAudioOutput(opts *NewOutputOptions) (*pulseAudioOutput, error) {
 	// The device name is shown by PulseAudio volume controls (usually built
 	// into a desktop environment), so we might want to use device_name here.
 	// We could also maybe change the application icon name by device_type.
-	client, err := pulse.NewClient(pulse.ClientApplicationName("go-librespot"), pulse.ClientApplicationIconName("speaker"))
+	clientopts := []pulse.ClientOption{pulse.ClientApplicationName("go-librespot"), pulse.ClientApplicationIconName("speaker")}
+
+	if opts.RuntimeSocket != "" {
+		clientopts = append(clientopts, pulse.ClientServerString(opts.RuntimeSocket))
+	}
+
+	client, err := pulse.NewClient(clientopts...)
 	if err != nil {
 		return nil, err
 	}
@@ -43,11 +49,12 @@ func newPulseAudioOutput(opts *NewOutputOptions) (*pulseAudioOutput, error) {
 
 	// Create a new playback.
 	var channelOpt pulse.PlaybackOption
-	if opts.ChannelCount == 1 {
+	switch opts.ChannelCount {
+	case 1:
 		channelOpt = pulse.PlaybackMono
-	} else if opts.ChannelCount == 2 {
+	case 2:
 		channelOpt = pulse.PlaybackStereo
-	} else {
+	default:
 		return nil, fmt.Errorf("cannot play %d channels, pulse only supports mono and stereo", opts.ChannelCount)
 	}
 	volumeUpdates := make(chan proto.ChannelVolumes, 1)
@@ -154,11 +161,9 @@ func (out *pulseAudioOutput) Resume() error {
 
 func (out *pulseAudioOutput) Drop() error {
 	if out.stream.Running() {
-		// Drop all samples while running. This happens when seeking.
-		// So we stop playback, flush the buffer, and restart it again to clear
-		// what's in the buffer. Presumably, all new samples from this point on
-		// are the new samples (isn't there a race condition here with
-		// SwitchingAudioSource?).
+		// Stop and flush the buffer. We do not restart here: the caller
+		// resumes once the new source is set. Restarting raced with the
+		// source switch and clipped the start of the track (#292).
 		out.stream.Stop()
 		err := out.client.RawRequest(&proto.FlushPlaybackStream{
 			StreamIndex: out.stream.StreamIndex(),
@@ -166,10 +171,8 @@ func (out *pulseAudioOutput) Drop() error {
 		if err != nil {
 			return fmt.Errorf("Drop: could not flush playback: %e", err)
 		}
-		out.stream.Start()
 	} else {
-		// This sometimes happens. But we don't need to do anything: we already
-		// flushed the buffer in Pause().
+		// Already stopped, e.g. flushed in Pause().
 	}
 	return nil
 }

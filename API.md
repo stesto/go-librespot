@@ -21,6 +21,11 @@ The websocket endpoint is available at `/events`. The following events are emitt
     - `album_cover_url`: Track album cover image URL
     - `position`: Track position in milliseconds
     - `duration`: Track duration in milliseconds
+    - `format`: Spotify name of the audio file being decoded, e.g. `OGG_VORBIS_160`
+    - `codec`: Codec family of that file: `vorbis`, `flac`, `mp3`, `aac` or `unknown`
+    - `bitrate`: Nominal bitrate in kbps, `null` for formats without a fixed one such as FLAC
+    - `sample_rate`: Sample rate of the decoded audio in Hz
+    - `bit_depth`: Bits per sample of the source audio, `null` for lossy formats
 - `will_play`: The player is about to play the specified track
     - `context_uri`: The context URI
     - `uri`: The track URI
@@ -40,6 +45,17 @@ The websocket endpoint is available at `/events`. The following events are emitt
     - `play_origin`: Who started the playback
 - `stopped`: The current context is empty, nothing more to play
     - `play_origin`: Who started the playback
+- `playback_error`: Playing a track failed
+    - `context_uri`: The context URI
+    - `uri`: The track URI
+    - `play_origin`: Who started the playback
+    - `stage`: Where it failed: `load` (the track could not be loaded), `playback` (the output failed mid-track; a
+      `stopped` event follows) or `session` (the connection to Spotify was lost for good)
+    - `kind`: What kind of failure it was: `restricted`, `unsupported`, `rate_limited`, `rejected`, `server`,
+      `timeout`, `network` or `unknown`
+    - `unplayable`: Whether the track itself cannot be played (restricted, in no supported format, or its audio key
+      was refused). The player skips such a track when it can, so playback may carry on
+    - `message`: The error, for a human to read
 - `seek`: The current track was seeked, the following data is provided:
     - `context_uri`: The context URI
     - `uri`: The track URI

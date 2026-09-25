@@ -2,16 +2,20 @@ package player
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math"
 	"net/http"
 	"net/url"
+	"sync/atomic"
 	"time"
 
 	librespot "github.com/devgianlu/go-librespot"
 	"github.com/devgianlu/go-librespot/audio"
+	"github.com/devgianlu/go-librespot/cache"
 	"github.com/devgianlu/go-librespot/flac"
+	"github.com/devgianlu/go-librespot/mp3"
 	"github.com/devgianlu/go-librespot/output"
 	"github.com/devgianlu/go-librespot/playplay"
 	downloadpb "github.com/devgianlu/go-librespot/proto/spotify/download"
@@ -33,6 +37,8 @@ const MaxStateVolume = 65535
 
 const CdnUrlQuarantineDuration = 15 * time.Minute
 
+var ErrPlayerClosed = errors.New("player is closed")
+
 func ptr[T any](v T) *T {
 	return &v
 }
@@ -40,26 +46,39 @@ func ptr[T any](v T) *T {
 type Player struct {
 	log librespot.Logger
 
+	crossfadeSamples          int
 	flacEnabled               bool
 	normalisationEnabled      bool
 	normalisationUseAlbumGain bool
 	normalisationPregain      float32
-	countryCode               *string
+	countryCode               func() string
 
 	sp       *spclient.Spclient
 	audioKey *audio.KeyProvider
 	events   EventManager
 
+	cache *cache.Cache
+
 	cdnQuarantine map[string]time.Time
 
-	newOutput func(source librespot.Float32Reader, volume float32) (output.Output, error)
+	newOutput func(source librespot.Float32Reader, volume float32, device string) (output.Output, error)
 
-	cmd chan playerCmd
-	ev  chan Event
+	// defaultAudioDevice is the output device to open initially. manageLoop
+	// tracks the current device from here and it can be changed at runtime via
+	// ReopenOutput.
+	defaultAudioDevice string
+
+	cmd    chan playerCmd
+	ev     chan Event
+	closed chan struct{}
 
 	volumeSteps uint32
 
 	startedPlaying time.Time
+
+	// streamGen counts the primary streams set, so that events can say which
+	// one they came from. Written only by manageLoop, read from anywhere.
+	streamGen atomic.Uint64
 }
 
 type playerCmdType int
@@ -72,6 +91,7 @@ const (
 	playerCmdSeek
 	playerCmdPosition
 	playerCmdVolume
+	playerCmdReopenOutput
 	playerCmdClose
 )
 
@@ -95,6 +115,10 @@ type Options struct {
 
 	Log librespot.Logger
 
+	// Cache, when non-nil, is used to store and retrieve encrypted audio files
+	// on disk, avoiding a CDN download when a track is played again.
+	Cache *cache.Cache
+
 	// FlacEnabled specifies if FLAC files should be preferred when available.
 	// When setting this to true, it is assumed that the PlayPlay plugin is provided.
 	FlacEnabled bool
@@ -109,14 +133,25 @@ type Options struct {
 	// in dB. Use negative values to avoid clipping.
 	NormalisationPregain float32
 
-	// CountryCode specifies the country code to use for media restrictions.
-	CountryCode *string
+	// CrossfadeDuration specifies for how long tracks should overlap during
+	// a track change. Zero disables crossfading.
+	CrossfadeDuration time.Duration
+
+	// CountryCode reports the country code to use for media restrictions. It is
+	// read while building a stream, which happens off the daemon's player loop,
+	// so it is a function rather than a pointer the daemon writes through.
+	CountryCode func() string
 
 	// AudioBackend specifies the audio backend to use (alsa, pulseaudio, etc).
 	AudioBackend string
+	// AudioBackendRuntimeSocket specifies a prefixed with protocol (e.g. `unix:` or `tcp:`) path
+	// to a runtime socket of audio backend.
+	//
+	// This feature is support only for the pulseaudio backend.
+	AudioBackendRuntimeSocket string
 	// AudioDevice specifies the audio device name.
 	//
-	// This feature is support only for the alsa backend.
+	// This feature is support only for the alsa and pulseaudio backend.
 	AudioDevice string
 	// MixerDevice specifies the audio mixer name.
 	//
@@ -126,7 +161,6 @@ type Options struct {
 	//
 	// This only works in combination with Mixer.
 	MixerControlName string
-
 	// AudioBufferTime is the buffer time in microseconds.
 	//
 	// This is only supported on the alsa backend.
@@ -156,42 +190,56 @@ type Options struct {
 	//
 	// This is only supported on the pipe backend.
 	AudioOutputPipeFormat string
+
+	// AudioOutputPipeWaitForReader makes the pipe backend wait for a reader to
+	// appear when opening the FIFO, instead of failing if none is present at the
+	// time playback starts. This is useful for readers (e.g. snapcast with
+	// dryout) that only connect to the FIFO when data is expected.
+	//
+	// This is only supported on the pipe backend.
+	AudioOutputPipeWaitForReader bool
 }
 
 func NewPlayer(opts *Options) (*Player, error) {
 	p := &Player{
 		log:                       opts.Log,
+		crossfadeSamples:          int(opts.CrossfadeDuration*SampleRate/time.Second) * Channels,
 		sp:                        opts.Spclient,
 		audioKey:                  opts.AudioKey,
 		events:                    opts.Events,
+		cache:                     opts.Cache,
 		cdnQuarantine:             make(map[string]time.Time),
 		flacEnabled:               opts.FlacEnabled,
 		normalisationEnabled:      opts.NormalisationEnabled,
 		normalisationUseAlbumGain: opts.NormalisationUseAlbumGain,
 		normalisationPregain:      opts.NormalisationPregain,
 		countryCode:               opts.CountryCode,
-		newOutput: func(reader librespot.Float32Reader, volume float32) (output.Output, error) {
+		defaultAudioDevice:        opts.AudioDevice,
+		newOutput: func(reader librespot.Float32Reader, volume float32, device string) (output.Output, error) {
 			return output.NewOutput(&output.NewOutputOptions{
-				Log:              opts.Log,
-				Backend:          opts.AudioBackend,
-				Reader:           reader,
-				SampleRate:       SampleRate,
-				ChannelCount:     Channels,
-				Device:           opts.AudioDevice,
-				Mixer:            opts.MixerDevice,
-				Control:          opts.MixerControlName,
-				InitialVolume:    volume,
-				BufferTimeMicro:  opts.AudioBufferTime,
-				PeriodCount:      opts.AudioPeriodCount,
-				ExternalVolume:   opts.ExternalVolume,
-				VolumeUpdate:     opts.VolumeUpdate,
-				OutputPipe:       opts.AudioOutputPipe,
-				OutputPipeFormat: opts.AudioOutputPipeFormat,
+				Log:                     opts.Log,
+				Backend:                 opts.AudioBackend,
+				Reader:                  reader,
+				SampleRate:              SampleRate,
+				ChannelCount:            Channels,
+				Device:                  device,
+				RuntimeSocket:           opts.AudioBackendRuntimeSocket,
+				Mixer:                   opts.MixerDevice,
+				Control:                 opts.MixerControlName,
+				InitialVolume:           volume,
+				BufferTimeMicro:         opts.AudioBufferTime,
+				PeriodCount:             opts.AudioPeriodCount,
+				ExternalVolume:          opts.ExternalVolume,
+				VolumeUpdate:            opts.VolumeUpdate,
+				OutputPipe:              opts.AudioOutputPipe,
+				OutputPipeFormat:        opts.AudioOutputPipeFormat,
+				OutputPipeWaitForReader: opts.AudioOutputPipeWaitForReader,
 			})
 		},
 
-		cmd: make(chan playerCmd),
-		ev:  make(chan Event, 128),
+		cmd:    make(chan playerCmd),
+		ev:     make(chan Event, 128),
+		closed: make(chan struct{}),
 	}
 
 	go p.manageLoop()
@@ -207,8 +255,14 @@ func (p *Player) manageLoop() {
 	// initial volume is 1
 	volume := float32(1)
 
+	// whether the output is paused, so seek knows whether to resume after Drop
+	paused := false
+
+	// current output device; can be changed at runtime via playerCmdReopenOutput
+	device := p.defaultAudioDevice
+
 	// init main source
-	source := NewSwitchingAudioSource()
+	source := NewSwitchingAudioSource(p.crossfadeSamples)
 
 loop:
 	for {
@@ -226,7 +280,7 @@ loop:
 				// create a new output device if needed
 				if out == nil {
 					var err error
-					out, err = p.newOutput(source, volume)
+					out, err = p.newOutput(source, volume, device)
 					if err != nil {
 						cmd.resp <- err
 						break
@@ -236,7 +290,17 @@ loop:
 					p.log.Debugf("created new output device")
 				}
 
-				// set source
+				// Flush the previous source before switching, otherwise the
+				// new track's opening is buffered then dropped, clipping it on
+				// pulseaudio (#292).
+				if data.drop {
+					_ = out.Drop()
+				}
+
+				// Counted before the events below so they carry the stream they
+				// describe, and so that whoever set it can tell which that was.
+				p.streamGen.Add(1)
+
 				source.SetPrimary(data.source)
 				if data.paused {
 					if err := out.Pause(); err != nil {
@@ -249,28 +313,27 @@ loop:
 						break
 					}
 				}
-
-				if data.drop {
-					_ = out.Drop()
-				}
+				paused = data.paused
 
 				p.startedPlaying = time.Now()
 				cmd.resp <- nil
 
 				if data.paused {
-					p.ev <- Event{Type: EventTypePause}
+					p.ev <- Event{Type: EventTypePause, StreamGen: p.streamGen.Load()}
 				} else {
-					p.ev <- Event{Type: EventTypePlay}
+					p.ev <- Event{Type: EventTypePlay, StreamGen: p.streamGen.Load()}
 				}
 			case playerCmdPlay:
 				if out != nil {
 					if err := out.Resume(); err != nil {
 						cmd.resp <- err
 					} else {
+						paused = false
 						cmd.resp <- nil
-						p.ev <- Event{Type: EventTypeResume}
+						p.ev <- Event{Type: EventTypeResume, StreamGen: p.streamGen.Load()}
 					}
 				} else {
+					paused = false
 					cmd.resp <- nil
 				}
 			case playerCmdPause:
@@ -278,10 +341,12 @@ loop:
 					if err := out.Pause(); err != nil {
 						cmd.resp <- err
 					} else {
+						paused = true
 						cmd.resp <- nil
-						p.ev <- Event{Type: EventTypePause}
+						p.ev <- Event{Type: EventTypePause, StreamGen: p.streamGen.Load()}
 					}
 				} else {
+					paused = true
 					cmd.resp <- nil
 				}
 			case playerCmdStop:
@@ -294,7 +359,7 @@ loop:
 				}
 
 				cmd.resp <- struct{}{}
-				p.ev <- Event{Type: EventTypeStop}
+				p.ev <- Event{Type: EventTypeStop, StreamGen: p.streamGen.Load()}
 			case playerCmdSeek:
 				if out != nil {
 					if err := source.SetPositionMs(cmd.data.(int64)); err != nil {
@@ -302,7 +367,11 @@ loop:
 					} else if err = out.Drop(); err != nil {
 						cmd.resp <- err
 					} else {
-						cmd.resp <- nil
+						// Drop no longer restarts the stream; resume unless paused.
+						if !paused {
+							err = out.Resume()
+						}
+						cmd.resp <- err
 					}
 				} else {
 					cmd.resp <- nil
@@ -325,6 +394,56 @@ loop:
 				if out != nil {
 					out.SetVolume(volume)
 				}
+			case playerCmdReopenOutput:
+				// Reopen the output on a new device without touching the Spotify
+				// session, keeping the current source and playback position.
+				device = cmd.data.(string)
+
+				if out == nil {
+					// Nothing playing: the new device takes effect the next time
+					// an output is opened. Callers wanting audio to resume (e.g.
+					// recovery after the device died) should issue a play/resume
+					// afterwards.
+					cmd.resp <- nil
+					break
+				}
+
+				// Close the old device before opening the new one: some backends
+				// (e.g. pulseaudio) start reading from the source as soon as the
+				// output is constructed, so two live outputs would corrupt the
+				// stream. A sub-second gap from the discarded buffer is expected.
+				_ = out.Drop()
+				_ = out.Close()
+				out = nil
+				outErr = make(<-chan error)
+
+				newOut, err := p.newOutput(source, volume, device)
+				if err != nil {
+					// The old device is already gone; playback stays silent until
+					// an output is reopened. Surface the failure to the caller.
+					p.log.WithError(err).Warnf("failed reopening output on %q", device)
+					cmd.resp <- err
+					break
+				}
+
+				out = newOut
+				outErr = out.Error()
+
+				if paused {
+					err = out.Pause()
+				} else {
+					err = out.Resume()
+				}
+				if err != nil {
+					_ = out.Close()
+					out = nil
+					outErr = make(<-chan error)
+					cmd.resp <- err
+					break
+				}
+
+				p.log.Infof("reopened output device on %q", device)
+				cmd.resp <- nil
 			case playerCmdClose:
 				break loop
 			default:
@@ -343,13 +462,13 @@ loop:
 			p.log.Tracef("cleared closed output device")
 
 			// FIXME: this is called even if not needed, like when autoplay starts
-			p.ev <- Event{Type: EventTypeStop}
+			p.ev <- Event{Type: EventTypeStop, StreamGen: p.streamGen.Load(), Err: err}
 		case <-source.Done():
-			p.ev <- Event{Type: EventTypeNotPlaying}
+			p.ev <- Event{Type: EventTypeNotPlaying, StreamGen: p.streamGen.Load()}
 		}
 	}
 
-	close(p.cmd)
+	close(p.closed)
 
 	_ = source.Close()
 
@@ -367,22 +486,46 @@ func (p *Player) HasBeenPlayingFor() time.Duration {
 	return time.Since(p.startedPlaying)
 }
 
+// StreamGen identifies the primary stream currently set, counting up each time
+// one is set. Read it after SetPrimaryStream to learn which generation the
+// stream just handed over is; events carry the same value.
+func (p *Player) StreamGen() uint64 {
+	return p.streamGen.Load()
+}
+
 func (p *Player) Receive() <-chan Event {
 	return p.ev
 }
 
+// send hands cmd to manageLoop, reporting false if the player has already been
+// closed and the command was therefore not delivered. Once the send succeeds
+// manageLoop always answers cmd.resp before it can exit, so callers may wait on
+// the response unconditionally.
+func (p *Player) send(cmd playerCmd) bool {
+	select {
+	case p.cmd <- cmd:
+		return true
+	case <-p.closed:
+		return false
+	}
+}
+
+// Close stops the player. It is safe to call more than once and safe to call
+// while other goroutines are issuing commands: those get ErrPlayerClosed.
 func (p *Player) Close() {
-	p.cmd <- playerCmd{typ: playerCmdClose}
+	p.send(playerCmd{typ: playerCmdClose})
 }
 
 func (p *Player) SetVolume(val uint32) {
 	vol := float32(val) / MaxStateVolume
-	p.cmd <- playerCmd{typ: playerCmdVolume, data: vol}
+	p.send(playerCmd{typ: playerCmdVolume, data: vol})
 }
 
 func (p *Player) Play() error {
 	resp := make(chan any, 1)
-	p.cmd <- playerCmd{typ: playerCmdPlay, resp: resp}
+	if !p.send(playerCmd{typ: playerCmdPlay, resp: resp}) {
+		return ErrPlayerClosed
+	}
 	if err := <-resp; err != nil {
 		return err.(error)
 	}
@@ -392,7 +535,9 @@ func (p *Player) Play() error {
 
 func (p *Player) Pause() error {
 	resp := make(chan any, 1)
-	p.cmd <- playerCmd{typ: playerCmdPause, resp: resp}
+	if !p.send(playerCmd{typ: playerCmdPause, resp: resp}) {
+		return ErrPlayerClosed
+	}
 	if err := <-resp; err != nil {
 		return err.(error)
 	}
@@ -402,13 +547,17 @@ func (p *Player) Pause() error {
 
 func (p *Player) Stop() {
 	resp := make(chan any, 1)
-	p.cmd <- playerCmd{typ: playerCmdStop, resp: resp}
+	if !p.send(playerCmd{typ: playerCmdStop, resp: resp}) {
+		return
+	}
 	<-resp
 }
 
 func (p *Player) SeekMs(pos int64) error {
 	resp := make(chan any, 1)
-	p.cmd <- playerCmd{typ: playerCmdSeek, data: pos, resp: resp}
+	if !p.send(playerCmd{typ: playerCmdSeek, data: pos, resp: resp}) {
+		return ErrPlayerClosed
+	}
 	if err := <-resp; err != nil {
 		return err.(error)
 	}
@@ -416,16 +565,40 @@ func (p *Player) SeekMs(pos int64) error {
 	return nil
 }
 
+// PositionMs returns the current playback position, or zero if the player has
+// been closed.
 func (p *Player) PositionMs() int64 {
 	resp := make(chan any, 1)
-	p.cmd <- playerCmd{typ: playerCmdPosition, resp: resp}
+	if !p.send(playerCmd{typ: playerCmdPosition, resp: resp}) {
+		return 0
+	}
 	pos := <-resp
 	return pos.(int64)
 }
 
+// ReopenOutput reopens the audio output on the given device without touching
+// the Spotify session, preserving the current playback position, paused state
+// and volume. If playback is currently active it switches devices live (with a
+// brief audio gap); if nothing is playing it just records the device for the
+// next output open. It returns an error if the new device fails to open, in
+// which case playback is left stopped.
+func (p *Player) ReopenOutput(device string) error {
+	resp := make(chan any, 1)
+	if !p.send(playerCmd{typ: playerCmdReopenOutput, data: device, resp: resp}) {
+		return ErrPlayerClosed
+	}
+	if err := <-resp; err != nil {
+		return err.(error)
+	}
+
+	return nil
+}
+
 func (p *Player) SetPrimaryStream(source librespot.AudioSource, paused, drop bool) error {
 	resp := make(chan any)
-	p.cmd <- playerCmd{typ: playerCmdSet, data: playerCmdDataSet{source: source, primary: true, paused: paused, drop: drop}, resp: resp}
+	if !p.send(playerCmd{typ: playerCmdSet, data: playerCmdDataSet{source: source, primary: true, paused: paused, drop: drop}, resp: resp}) {
+		return ErrPlayerClosed
+	}
 	if err := <-resp; err != nil {
 		return err.(error)
 	}
@@ -435,7 +608,9 @@ func (p *Player) SetPrimaryStream(source librespot.AudioSource, paused, drop boo
 
 func (p *Player) SetSecondaryStream(source librespot.AudioSource) {
 	resp := make(chan any)
-	p.cmd <- playerCmd{typ: playerCmdSet, data: playerCmdDataSet{source: source, primary: false}, resp: resp}
+	if !p.send(playerCmd{typ: playerCmdSet, data: playerCmdDataSet{source: source, primary: false}, resp: resp}) {
+		return
+	}
 	<-resp
 }
 
@@ -516,15 +691,22 @@ func (p *Player) retrieveAudioKey(ctx context.Context, spotId librespot.SpotifyI
 const spotifyLoudnessTarget = -14.0
 
 func calculateNormalisationFactor(params *audiofilespb.NormalizationParams, pregain float32) float32 {
+	return normalisationFactorFor(params.LoudnessDb, params.TruePeakDb, pregain)
+}
+
+// normalisationFactorFor is the same calculation for audio that carries its
+// loudness outside NormalizationParams, as DJ narration does in its
+// narration.*.loudness and narration.*.true_peak metadata.
+func normalisationFactorFor(loudnessDb, truePeakDb, pregain float32) float32 {
 	// LoudnessDb is the integrated loudness of the track in LUFS (ITU-R BS.1770)
 	// To normalize, calculate the gain needed to reach Spotify's target of -14 LUFS
-	gainDb := spotifyLoudnessTarget - params.LoudnessDb + pregain
+	gainDb := spotifyLoudnessTarget - loudnessDb + pregain
 
 	// Convert gain from dB to linear scale
 	normalisationFactor := float32(math.Pow(10, float64(gainDb/20)))
 
 	// TruePeakDb from audio files response is in dBTP (dB True Peak)
-	truePeakLinear := float32(math.Pow(10, float64(params.TruePeakDb)/20))
+	truePeakLinear := float32(math.Pow(10, float64(truePeakDb)/20))
 	if truePeakLinear <= 0 {
 		return normalisationFactor
 	}
@@ -545,13 +727,13 @@ func (p *Player) getUnrestrictedTrack(ctx context.Context, spotId librespot.Spot
 	}
 
 	media := librespot.NewMediaFromTrack(&trackMeta)
-	if !isMediaRestricted(media, *p.countryCode) {
+	if !isMediaRestricted(media, p.countryCode()) {
 		return &trackMeta, nil
 	}
 
 	for _, alt := range trackMeta.Alternative {
 		media = librespot.NewMediaFromTrack(alt)
-		if !isMediaRestricted(media, *p.countryCode) {
+		if !isMediaRestricted(media, p.countryCode()) {
 			// Clear alternatives to avoid confusion
 			trackMeta.Alternative = nil
 
@@ -569,8 +751,23 @@ func (p *Player) getUnrestrictedTrack(ctx context.Context, spotId librespot.Spot
 	return nil, librespot.ErrMediaRestricted
 }
 
+// StartPosition is where media of the given duration should start playing when
+// asked to start at position. A position past the end, which a transfer from a
+// client with stale playback state can carry, would end the track the moment it
+// started and skip straight to the next one, so the track starts over instead.
+func StartPosition(position, duration int64) int64 {
+	if position <= 0 || position >= duration {
+		return 0
+	}
+	return position
+}
+
 func (p *Player) NewStream(ctx context.Context, client *http.Client, spotId librespot.SpotifyId, bitrate int, mediaPosition int64) (*Stream, error) {
 	log := p.log.WithField("uri", spotId.Uri())
+
+	// Remember the id the caller asked for: spotId is reassigned below when a
+	// restricted track is relinked to an alternative.
+	requestedId := spotId
 
 	playbackId := make([]byte, 16)
 	_, _ = rand.Read(playbackId)
@@ -606,16 +803,17 @@ func (p *Player) NewStream(ctx context.Context, client *http.Client, spotId libr
 		}
 
 		if p.normalisationEnabled {
+			var params *audiofilespb.NormalizationParams
 			if p.normalisationUseAlbumGain {
-				normalisationFactor = calculateNormalisationFactor(
-					audioFilesResp.DefaultAlbumNormalizationParams,
-					p.normalisationPregain,
-				)
+				params = audioFilesResp.DefaultAlbumNormalizationParams
 			} else {
-				normalisationFactor = calculateNormalisationFactor(
-					audioFilesResp.DefaultFileNormalizationParams,
-					p.normalisationPregain,
-				)
+				params = audioFilesResp.DefaultFileNormalizationParams
+			}
+
+			if params != nil {
+				normalisationFactor = calculateNormalisationFactor(params, p.normalisationPregain)
+			} else {
+				normalisationFactor = 1
 			}
 		} else {
 			normalisationFactor = 1
@@ -628,7 +826,7 @@ func (p *Player) NewStream(ctx context.Context, client *http.Client, spotId libr
 		}
 
 		media = librespot.NewMediaFromEpisode(&episodeMeta)
-		if isMediaRestricted(media, *p.countryCode) {
+		if isMediaRestricted(media, p.countryCode()) {
 			return nil, librespot.ErrMediaRestricted
 		}
 
@@ -653,19 +851,59 @@ func (p *Player) NewStream(ctx context.Context, client *http.Client, spotId libr
 
 	p.events.PostStreamRequestAudioKey(playbackId)
 
-	storageResolve, err := p.sp.ResolveStorageInteractive(ctx, file.FileId, file.Format, false)
-	if err != nil {
-		return nil, fmt.Errorf("failed resolving track storage: %w", err)
+	// Prefer a cached copy of the encrypted audio file when available: this
+	// avoids resolving storage and downloading from the CDN entirely. The audio
+	// key is still required to decrypt it below.
+	var rawStream librespot.SizedReadAtSeeker
+
+	// Close the raw stream if stream setup fails before it is handed off to a
+	// Stream (e.g. a cached file that fails to decode); this releases the open
+	// file handle or cancels the in-flight download.
+	streamHandedOff := false
+	defer func() {
+		if !streamHandedOff {
+			if closer, ok := rawStream.(io.Closer); ok && closer != nil {
+				_ = closer.Close()
+			}
+		}
+	}()
+
+	if p.cache != nil {
+		if cached, ok := p.cache.File(file.FileId); ok {
+			log.Debugf("using cached audio file (%d bytes)", cached.Size())
+			rawStream = cached
+		}
 	}
 
-	p.events.PostStreamResolveStorage(playbackId)
+	if rawStream == nil {
+		storageResolve, err := p.sp.ResolveStorageInteractive(ctx, file.FileId, file.Format, false)
+		if err != nil {
+			return nil, fmt.Errorf("failed resolving track storage: %w", err)
+		}
 
-	rawStream, err := p.httpChunkedReaderFromStorageResolve(log, client, storageResolve)
-	if err != nil {
-		return nil, fmt.Errorf("failed creating chunked reader: %w", err)
+		p.events.PostStreamResolveStorage(playbackId)
+
+		httpStream, err := p.httpChunkedReaderFromStorageResolve(log, client, storageResolve)
+		if err != nil {
+			return nil, fmt.Errorf("failed creating chunked reader: %w", err)
+		}
+
+		p.events.PostStreamInitHttpChunkReader(playbackId, httpStream)
+
+		// Persist the encrypted file to the cache once it has been fully
+		// downloaded. This is best-effort: caching failures never affect
+		// playback.
+		if p.cache != nil {
+			fileId := file.FileId
+			httpStream.OnComplete(func(r io.ReaderAt, size int64) {
+				if err := p.cache.SaveFile(fileId, io.NewSectionReader(r, 0, size)); err != nil {
+					log.WithError(err).Warnf("failed caching audio file")
+				}
+			})
+		}
+
+		rawStream = httpStream
 	}
-
-	p.events.PostStreamInitHttpChunkReader(playbackId, rawStream)
 
 	decryptedStream, err := audio.NewAesAudioDecryptor(rawStream, audioKey)
 	if err != nil {
@@ -673,6 +911,7 @@ func (p *Player) NewStream(ctx context.Context, client *http.Client, spotId libr
 	}
 
 	var stream librespot.AudioSource
+	var sampleRate, bitDepth int32
 
 	audioFormat := GetAudioFileFormatAudioFormat(*file.Format)
 	if audioFormat == AudioFormatOGGVorbis {
@@ -693,6 +932,7 @@ func (p *Player) NewStream(ctx context.Context, client *http.Client, spotId libr
 		}
 
 		stream = vorbisStream
+		sampleRate = vorbisStream.SampleRate
 	} else if audioFormat == AudioFormatFLAC {
 		audioStream := io.NewSectionReader(decryptedStream, 0, rawStream.Size())
 		flacStream, err := flac.New(log, audioStream, normalisationFactor)
@@ -707,16 +947,44 @@ func (p *Player) NewStream(ctx context.Context, client *http.Client, spotId libr
 		}
 
 		stream = flacStream
+		sampleRate = flacStream.SampleRate
+		bitDepth = flacStream.BitDepth
+	} else if audioFormat == AudioFormatMP3 {
+		audioStream := io.NewSectionReader(decryptedStream, 0, rawStream.Size())
+		mp3Stream, err := mp3.New(log, audioStream, normalisationFactor)
+		if err != nil {
+			return nil, fmt.Errorf("failed initializing mp3 stream: %w", err)
+		}
+
+		if mp3Stream.SampleRate != SampleRate {
+			return nil, fmt.Errorf("unsupported sample rate: %d", mp3Stream.SampleRate)
+		} else if mp3Stream.Channels != Channels {
+			return nil, fmt.Errorf("unsupported channels: %d", mp3Stream.Channels)
+		}
+
+		stream = mp3Stream
+		sampleRate = mp3Stream.SampleRate
 	} else {
 		return nil, fmt.Errorf("unsupported audio format: %s", *file.Format)
 	}
 
 	// Seek to the correct position if needed.
-	if mediaPosition > 0 {
-		if err := stream.SetPositionMs(max(0, min(mediaPosition, int64(media.Duration())))); err != nil {
+	if position := StartPosition(mediaPosition, int64(media.Duration())); position > 0 {
+		if err := stream.SetPositionMs(position); err != nil {
 			return nil, fmt.Errorf("failed seeking stream: %w", err)
 		}
+	} else if mediaPosition > 0 {
+		log.Debugf("start position %dms is past the end (%dms), starting from the beginning", mediaPosition, media.Duration())
 	}
 
-	return &Stream{PlaybackId: playbackId, Source: stream, Media: media, File: file}, nil
+	streamHandedOff = true
+	return &Stream{
+		PlaybackId:  playbackId,
+		RequestedId: requestedId,
+		Source:      stream,
+		Media:       media,
+		File:        file,
+		SampleRate:  sampleRate,
+		BitDepth:    bitDepth,
+	}, nil
 }

@@ -3,6 +3,7 @@ package tracks
 import (
 	"context"
 	"fmt"
+	"maps"
 	"slices"
 	"time"
 
@@ -10,12 +11,29 @@ import (
 	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
 	"github.com/devgianlu/go-librespot/spclient"
 	"golang.org/x/exp/rand"
+	"google.golang.org/protobuf/proto"
+)
+
+type ContextResolver interface {
+	librespot.PageResolver[*connectpb.ContextTrack]
+
+	Type() librespot.SpotifyIdType
+	Uri() string
+	Metadata() map[string]string
+}
+
+const (
+	// seekMaxPages bounds how many pages a walk of the context may fetch.
+	seekMaxPages = 256
+
+	// seekWalkTimeout bounds a walk of the context in wall-clock time.
+	seekWalkTimeout = 10 * time.Second
 )
 
 type List struct {
 	log librespot.Logger
 
-	ctx *spclient.ContextResolver
+	ctx ContextResolver
 
 	shuffled    bool
 	shuffleSeed uint64
@@ -28,17 +46,22 @@ type List struct {
 }
 
 func NewTrackListFromContext(ctx context.Context, log_ librespot.Logger, sp *spclient.Spclient, spotCtx *connectpb.Context) (_ *List, err error) {
-	tl := &List{}
-	tl.ctx, err = spclient.NewContextResolver(ctx, log_, sp, spotCtx)
+	resolver, err := spclient.NewContextResolver(ctx, log_, sp, spotCtx)
 	if err != nil {
 		return nil, fmt.Errorf("failed initializing context resolver: %w", err)
 	}
+
+	return newTrackList(log_, resolver), nil
+}
+
+func newTrackList(log_ librespot.Logger, resolver ContextResolver) *List {
+	tl := &List{ctx: resolver}
 
 	tl.log = log_.WithField("uri", tl.ctx.Uri())
 	tl.log.Debugf("resolved context of %s", tl.ctx.Type())
 
 	tl.tracks = newPagedList[*connectpb.ContextTrack](tl.log, tl.ctx)
-	return tl, nil
+	return tl
 }
 
 func (tl *List) Metadata() map[string]string {
@@ -58,13 +81,79 @@ func (tl *List) TrySeek(ctx context.Context, f func(track *connectpb.ContextTrac
 	return nil
 }
 
+// seekQueue positions the list on track if the queue holds it, dropping the
+// entries ahead of it, and reports whether it did.
+func (tl *List) seekQueue(track *connectpb.ContextTrack) bool {
+	// queue[0] is the track playing right now, so a jump can only target what
+	// comes after it.
+	start := 0
+	if tl.playingQueue {
+		start = 1
+	}
+
+	// Queue entries carry a uid, so when the caller names one an exact uid
+	// match is the only evidence the queued copy was what got clicked.
+	match := func(queued *connectpb.ContextTrack) bool { return queued.Uid == track.Uid }
+	if len(track.Uid) == 0 {
+		match = ContextTrackComparator(tl.ctx.Type(), track)
+	}
+
+	for i := start; i < len(tl.queue); i++ {
+		if !match(tl.queue[i]) {
+			continue
+		}
+
+		// Everything queued ahead of the chosen track is skipped, and the
+		// chosen one becomes the queue entry now playing.
+		tl.queue = tl.queue[i:]
+		tl.playingQueue = true
+		return true
+	}
+
+	return false
+}
+
+// TrySeekTo positions the list at track, whether it is queued or part of the
+// context. When the bounded seek cannot find it in the context the track is
+// played anyway, ahead of the context, and playback carries on into the context
+// from its start afterwards.
+func (tl *List) TrySeekTo(ctx context.Context, track *connectpb.ContextTrack) error {
+	if tl.seekQueue(track) {
+		return nil
+	}
+
+	// Not a queued track, so we are leaving the queue. Drop the entry that was
+	// playing as well: it has been jumped away from. Whatever is queued behind
+	// it still follows this track.
+	if tl.playingQueue {
+		tl.queue = tl.queue[1:]
+		tl.playingQueue = false
+	}
+
+	if err := tl.Seek(ctx, ContextTrackComparator(tl.ctx.Type(), track)); err == nil {
+		return nil
+	} else {
+		tl.log.WithError(err).Warnf("failed seeking to track in context %s, playing it ahead of the context", tl.ctx.Uri())
+	}
+
+	tl.tracks.moveInjected(track)
+	return nil
+}
+
 func (tl *List) Seek(ctx context.Context, f func(*connectpb.ContextTrack) bool) error {
+	ctx, cancel := context.WithTimeout(ctx, seekWalkTimeout)
+	defer cancel()
+
 	iter := tl.tracks.iterStart()
 	for iter.next(ctx) {
 		curr := iter.get()
 		if f(curr.item) {
 			tl.tracks.move(iter)
 			return nil
+		}
+
+		if curr.pageIdx >= seekMaxPages {
+			return fmt.Errorf("gave up seeking after %d pages", curr.pageIdx+1)
 		}
 	}
 
@@ -75,20 +164,65 @@ func (tl *List) Seek(ctx context.Context, f func(*connectpb.ContextTrack) bool) 
 	return fmt.Errorf("could not find track")
 }
 
-func (tl *List) AllTracks(ctx context.Context) []*connectpb.ProvidedTrack {
-	tracks := make([]*connectpb.ProvidedTrack, 0, tl.tracks.len())
-
-	iter := tl.tracks.iterStart()
-	for iter.next(ctx) {
-		curr := iter.get()
-		tracks = append(tracks, librespot.ContextTrackToProvidedTrack(tl.ctx.Type(), curr.item))
+// AllTracks returns the tracks already loaded, oldest first, keeping at most the
+// last max of them. It never fetches: its one caller seeds an autoplay station
+// with recently played tracks, and is reached by having run out of context — so
+// whatever is still unfetched is by definition not recent.
+func (tl *List) AllTracks(max int) []*connectpb.ProvidedTrack {
+	items := tl.tracks.resident()
+	if max > 0 && len(items) > max {
+		items = items[len(items)-max:]
 	}
 
-	if err := iter.error(); err != nil {
-		tl.log.WithError(err).Error("failed fetching all tracks")
+	tracks := make([]*connectpb.ProvidedTrack, 0, len(items))
+	for _, item := range items {
+		tracks = append(tracks, librespot.ContextTrackToProvidedTrack(tl.ctx.Type(), item))
 	}
 
 	return tracks
+}
+
+// Snapshot is a plain-data view of a List: everything the daemon publishes about
+// it, owning all of its own memory. Building one is how the list stays behind a
+// single accessor while what it describes is read from elsewhere.
+type Snapshot struct {
+	Metadata map[string]string
+	Current  *connectpb.ProvidedTrack
+	Prev     []*connectpb.ProvidedTrack
+	Next     []*connectpb.ProvidedTrack
+	Index    *connectpb.ContextIndex
+}
+
+// cloneProvided copies a track away from the list that produced it.
+// ContextTrackToProvidedTrack hands over the ContextTrack's own metadata map,
+// and the list goes on writing to that map as queueing and autoplay flags
+// change, so a track that outlives the call has to own its copy.
+func cloneProvided(track *connectpb.ProvidedTrack) *connectpb.ProvidedTrack {
+	if track == nil {
+		return nil
+	}
+
+	return proto.Clone(track).(*connectpb.ProvidedTrack)
+}
+
+func cloneProvidedAll(tracks []*connectpb.ProvidedTrack) []*connectpb.ProvidedTrack {
+	for i, track := range tracks {
+		tracks[i] = cloneProvided(track)
+	}
+	return tracks
+}
+
+// Snapshot builds the view of this list the daemon publishes. nextHint, when
+// non-nil, supplies the upcoming order from a set_queue command; otherwise the
+// upcoming tracks are walked out of the context, which may fetch pages.
+func (tl *List) Snapshot(ctx context.Context, nextHint []*connectpb.ContextTrack) *Snapshot {
+	return &Snapshot{
+		Metadata: maps.Clone(tl.Metadata()),
+		Current:  cloneProvided(tl.CurrentTrack()),
+		Prev:     cloneProvidedAll(tl.PrevTracks()),
+		Next:     cloneProvidedAll(tl.NextTracks(ctx, nextHint)),
+		Index:    tl.Index(),
+	}
 }
 
 const MaxTracksInContext = 32
@@ -172,6 +306,12 @@ func (tl *List) Index() *connectpb.ContextIndex {
 	}
 
 	curr := tl.tracks.get()
+	if curr.pageIdx < 0 {
+		// An injected track (see TrySeekTo) sits outside the context's pages
+		// and so has no index within it.
+		return &connectpb.ContextIndex{}
+	}
+
 	return &connectpb.ContextIndex{Page: uint32(curr.pageIdx), Track: uint32(curr.itemIdx)}
 }
 
@@ -284,6 +424,15 @@ func (tl *List) SetQueue(_ []*connectpb.ContextTrack, next []*connectpb.ContextT
 	}
 }
 
+// UpcomingQueue returns the queued tracks still to play: the whole queue, less
+// the entry playing right now.
+func (tl *List) UpcomingQueue() []*connectpb.ContextTrack {
+	if tl.playingQueue {
+		return slices.Clone(tl.queue[1:])
+	}
+	return slices.Clone(tl.queue)
+}
+
 func (tl *List) SetPlayingQueue(val bool) {
 	tl.playingQueue = len(tl.queue) > 0 && val
 }
@@ -294,14 +443,23 @@ func (tl *List) ToggleShuffle(ctx context.Context, shuffle bool) error {
 	}
 
 	if shuffle {
-		// fetch all tracks
+		// Fetch all tracks, under the same bounds as a seek: a generated
+		// context hands out pages forever, so "all" has to stop somewhere or
+		// the command that asked for the shuffle never returns.
+		walkCtx, cancel := context.WithTimeout(ctx, seekWalkTimeout)
+
 		iter := tl.tracks.iterStart()
-		for iter.next(ctx) {
-			// TODO: check that we do not seek forever
+		for iter.next(walkCtx) {
+			if pageIdx := iter.get().pageIdx; pageIdx >= seekMaxPages {
+				tl.log.Warnf("shuffling only the first %d pages of the context", pageIdx+1)
+				break
+			}
 		}
 		if err := iter.error(); err != nil {
 			tl.log.WithError(err).Error("failed fetching all tracks")
 		}
+
+		cancel()
 
 		// generate new seed and use it to shuffle
 		tl.shuffleSeed = rand.Uint64() + 1
@@ -338,9 +496,16 @@ func (tl *List) ToggleShuffle(ctx context.Context, shuffle bool) error {
 			// remember current track
 			currentTrack := tl.current()
 
-			// clear tracks and seek to the current track
+			// Clear tracks and re-fetch them in order, then seek to the current
+			// track. Snapshot the list first: a failed re-fetch (e.g. a transient
+			// error while paging the context) would otherwise leave the list
+			// stranded at pos -1, and the next access would panic. On failure we
+			// roll back to the previous (valid) state and report the error, so the
+			// shuffle toggle simply does not take effect.
+			savedList, savedPos := tl.tracks.list, tl.tracks.pos
 			tl.tracks.clear()
 			if err := tl.Seek(ctx, ContextTrackComparator(tl.ctx.Type(), currentTrack)); err != nil {
+				tl.tracks.list, tl.tracks.pos = savedList, savedPos
 				return fmt.Errorf("failed seeking to current track: %w", err)
 			}
 

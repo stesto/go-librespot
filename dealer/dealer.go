@@ -3,6 +3,7 @@ package dealer
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -19,6 +20,8 @@ const (
 	timeout      = 10 * time.Second
 )
 
+var ErrDealerClosed = errors.New("dealer closed")
+
 type Dealer struct {
 	log librespot.Logger
 
@@ -29,15 +32,16 @@ type Dealer struct {
 
 	conn *websocket.Conn
 
-	stop           bool
-	pingTickerStop chan struct{}
-	recvLoopStop   chan struct{}
-	recvLoopOnce   sync.Once
-	lastPong       time.Time
-	lastPongLock   sync.Mutex
+	ctx    context.Context
+	cancel context.CancelFunc
 
-	// connMu is held for writing when performing reconnection and for reading when accessing the conn.
-	// If it's not held, a valid connection is available. Be careful not to deadlock anything with this.
+	done         chan struct{}
+	closeOnce    sync.Once
+	recvLoopOnce sync.Once
+	lastPong     time.Time
+	lastPongLock sync.Mutex
+
+	// connMu protects conn pointer state.
 	connMu sync.RWMutex
 
 	messageReceivers     []messageReceiver
@@ -48,6 +52,7 @@ type Dealer struct {
 }
 
 func NewDealer(log librespot.Logger, client *http.Client, dealerAddr librespot.GetAddressFunc, accessToken librespot.GetLogin5TokenFunc) *Dealer {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Dealer{
 		client: &http.Client{
 			Transport:     client.Transport,
@@ -58,6 +63,9 @@ func NewDealer(log librespot.Logger, client *http.Client, dealerAddr librespot.G
 		log:              log,
 		addr:             dealerAddr,
 		accessToken:      accessToken,
+		ctx:              ctx,
+		cancel:           cancel,
+		done:             make(chan struct{}),
 		requestReceivers: map[string]requestReceiver{},
 	}
 }
@@ -66,7 +74,13 @@ func (d *Dealer) Connect(ctx context.Context) error {
 	d.connMu.Lock()
 	defer d.connMu.Unlock()
 
-	if d.conn != nil && !d.stop {
+	select {
+	case <-d.done:
+		return ErrDealerClosed
+	default:
+	}
+
+	if d.conn != nil {
 		d.log.Debugf("dealer connection already opened")
 		return nil
 	}
@@ -75,16 +89,13 @@ func (d *Dealer) Connect(ctx context.Context) error {
 }
 
 func (d *Dealer) connect(ctx context.Context) error {
-	d.recvLoopStop = make(chan struct{}, 1)
-	d.pingTickerStop = make(chan struct{}, 1)
-	d.stop = false
-
 	accessToken, err := d.accessToken(ctx, false)
 	if err != nil {
 		return fmt.Errorf("failed obtaining dealer access token: %w", err)
 	}
 
-	if conn, _, err := websocket.Dial(ctx, fmt.Sprintf("wss://%s/?access_token=%s", d.addr(ctx), accessToken), &websocket.DialOptions{
+	addr := d.addr(ctx)
+	if conn, _, err := websocket.Dial(ctx, fmt.Sprintf("wss://%s/?access_token=%s", addr, accessToken), &websocket.DialOptions{
 		HTTPClient: d.client,
 		HTTPHeader: http.Header{
 			"User-Agent": []string{librespot.UserAgent()},
@@ -92,41 +103,39 @@ func (d *Dealer) connect(ctx context.Context) error {
 	}); err != nil {
 		return err
 	} else {
+		if d.conn != nil {
+			_ = d.conn.Close(websocket.StatusServiceRestart, "")
+		}
+
 		// we assign to d.conn after because if Dial fails we'll have a nil d.conn which we don't want
 		d.conn = conn
+		d.log.Debug(fmt.Sprintf("connected to %s", addr))
 	}
 
 	// remove the read limit
 	d.conn.SetReadLimit(math.MaxUint32)
 
-	d.log.Debugf("dealer connection opened")
-
 	return nil
 }
 
 func (d *Dealer) Close() {
-	d.connMu.Lock()
-	defer d.connMu.Unlock()
+	d.closeOnce.Do(func() {
+		close(d.done)
 
-	d.stop = true
+		// Before cancelling, so the peer still gets a clean going-away frame:
+		// cancelling the context tears the websocket down abruptly.
+		d.closeConn(websocket.StatusGoingAway)
 
-	if d.conn == nil {
-		return
-	}
-
-	d.recvLoopStop <- struct{}{}
-	d.pingTickerStop <- struct{}{}
-	_ = d.conn.Close(websocket.StatusGoingAway, "")
+		d.cancel()
+	})
 }
 
 func (d *Dealer) startReceiving() {
 	d.recvLoopOnce.Do(func() {
 		d.log.Tracef("starting dealer recv loop")
-		go d.recvLoop()
-
-		// set last pong in the future
-		d.lastPong = time.Now().Add(pingInterval)
+		d.resetPongDeadline()
 		go d.pingTicker()
+		go d.recvLoop()
 	})
 }
 
@@ -136,39 +145,35 @@ func (d *Dealer) pingTicker() {
 loop:
 	for {
 		select {
-		case <-d.pingTickerStop:
+		case <-d.done:
 			break loop
 		case <-ticker.C:
-			d.lastPongLock.Lock()
-			timePassed := time.Since(d.lastPong)
-			d.lastPongLock.Unlock()
+			timePassed := d.timeSinceLastPong()
 			if timePassed > pingInterval+timeout {
 				d.log.Errorf("did not receive last pong from dealer, %.0fs passed", timePassed.Seconds())
 
 				// closing the connection should make the read on the "recvLoop" fail,
 				// continue hoping for a new connection
-				_ = d.conn.Close(websocket.StatusServiceRestart, "")
+				d.closeConn(websocket.StatusServiceRestart)
 				continue
 			}
 
-			ctx, cancel := context.WithTimeout(context.Background(), timeout)
-			d.connMu.RLock()
-			err := d.conn.Write(ctx, websocket.MessageText, []byte("{\"type\":\"ping\"}"))
-			d.connMu.RUnlock()
+			ctx, cancel := context.WithTimeout(d.ctx, timeout)
+			conn, err := d.writeConn(ctx, websocket.MessageText, []byte("{\"type\":\"ping\"}"))
 			cancel()
-			d.log.Tracef("sent dealer ping")
 
 			if err != nil {
-				if d.stop {
-					// break early without logging if we should stop
+				select {
+				case <-d.done:
 					break loop
+				default:
 				}
 
 				d.log.WithError(err).Warnf("failed sending dealer ping")
 
 				// closing the connection should make the read on the "recvLoop" fail,
 				// continue hoping for a new connection
-				_ = d.conn.Close(websocket.StatusServiceRestart, "")
+				d.closeConnRef(conn, websocket.StatusServiceRestart)
 				continue
 			}
 		}
@@ -181,17 +186,23 @@ func (d *Dealer) recvLoop() {
 loop:
 	for {
 		select {
-		case <-d.recvLoopStop:
+		case <-d.done:
 			break loop
 		default:
 			// no need to hold the connMu since reconnection happens in this routine
-			msgType, messageBytes, err := d.conn.Read(context.Background())
+			msgType, messageBytes, err := d.readConn(d.ctx)
 
-			// don't log closed error if we're stopping
-			if d.stop && websocket.CloseStatus(err) == websocket.StatusGoingAway {
-				d.log.Debugf("dealer connection closed")
-				break loop
-			} else if err != nil {
+			// don't log closed error if we're shutting down
+			if err != nil {
+				select {
+				case <-d.done:
+					if websocket.CloseStatus(err) == websocket.StatusGoingAway {
+						d.log.Debugf("dealer connection closed")
+					}
+					break loop
+				default:
+				}
+
 				d.log.WithError(err).Errorf("failed receiving dealer message")
 				break loop
 			} else if msgType != websocket.MessageText {
@@ -219,7 +230,6 @@ loop:
 				d.lastPongLock.Lock()
 				d.lastPong = time.Now()
 				d.lastPongLock.Unlock()
-				d.log.Tracef("received dealer pong")
 				break
 			default:
 				d.log.Warnf("unknown dealer message type: %s", message.Type)
@@ -229,12 +239,13 @@ loop:
 	}
 
 	// always close as we might end up here because of application errors
-	_ = d.conn.Close(websocket.StatusInternalError, "")
+	d.closeConn(websocket.StatusInternalError)
 
-	// if we shouldn't stop, try to reconnect
-	if !d.stop {
+	select {
+	case <-d.done:
+	default:
 		d.connMu.Lock()
-		if err := backoff.Retry(d.reconnect, backoff.NewExponentialBackOff()); err != nil {
+		if err := backoff.Retry(d.reconnect, backoff.WithContext(backoff.NewExponentialBackOff(), d.ctx)); err != nil {
 			d.log.WithError(err).Errorf("failed reconnecting dealer")
 			d.connMu.Unlock()
 
@@ -272,10 +283,8 @@ func (d *Dealer) sendReply(key string, success bool) error {
 		return fmt.Errorf("failed marshalling reply: %w", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	d.connMu.RLock()
-	err = d.conn.Write(ctx, websocket.MessageText, replyBytes)
-	d.connMu.RUnlock()
+	ctx, cancel := context.WithTimeout(d.ctx, timeout)
+	_, err = d.writeConn(ctx, websocket.MessageText, replyBytes)
 	cancel()
 	if err != nil {
 		return fmt.Errorf("failed sending dealer reply: %w", err)
@@ -285,16 +294,80 @@ func (d *Dealer) sendReply(key string, success bool) error {
 }
 
 func (d *Dealer) reconnect() error {
-	if err := d.connect(context.TODO()); err != nil {
+	if err := d.connect(d.ctx); err != nil {
 		return err
 	}
 
-	d.lastPongLock.Lock()
-	d.lastPong = time.Now()
-	d.lastPongLock.Unlock()
+	d.resetPongDeadline()
 	// restart the recv loop
 	go d.recvLoop()
 
 	d.log.Debugf("re-established dealer connection")
 	return nil
+}
+
+func (d *Dealer) resetPongDeadline() {
+	d.lastPongLock.Lock()
+	d.lastPong = time.Now().Add(pingInterval)
+	d.lastPongLock.Unlock()
+}
+
+func (d *Dealer) timeSinceLastPong() time.Duration {
+	d.lastPongLock.Lock()
+	defer d.lastPongLock.Unlock()
+	return time.Since(d.lastPong)
+}
+
+func (d *Dealer) closeConn(status websocket.StatusCode) {
+	d.connMu.RLock()
+	conn := d.conn
+	d.connMu.RUnlock()
+
+	d.closeConnRef(conn, status)
+}
+
+func (d *Dealer) closeConnRef(conn *websocket.Conn, status websocket.StatusCode) {
+	if conn != nil {
+		_ = conn.Close(status, "")
+	}
+}
+
+func (d *Dealer) writeConn(ctx context.Context, typ websocket.MessageType, payload []byte) (*websocket.Conn, error) {
+	d.connMu.RLock()
+	select {
+	case <-d.done:
+		d.connMu.RUnlock()
+		return nil, ErrDealerClosed
+	default:
+	}
+
+	conn := d.conn
+	d.connMu.RUnlock()
+
+	if conn == nil {
+		return nil, fmt.Errorf("dealer connection not established")
+	}
+
+	err := conn.Write(ctx, typ, payload)
+	if err != nil {
+		select {
+		case <-d.done:
+			return conn, ErrDealerClosed
+		default:
+		}
+	}
+
+	return conn, err
+}
+
+func (d *Dealer) readConn(ctx context.Context) (websocket.MessageType, []byte, error) {
+	d.connMu.RLock()
+	conn := d.conn
+	d.connMu.RUnlock()
+
+	if conn == nil {
+		return 0, nil, fmt.Errorf("dealer connection not established")
+	}
+
+	return conn.Read(ctx)
 }

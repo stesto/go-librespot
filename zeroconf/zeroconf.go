@@ -27,6 +27,7 @@ type Zeroconf struct {
 
 	listener  net.Listener
 	registrar ServiceRegistrar
+	closed    bool
 
 	dh *dh.DiffieHellman
 
@@ -64,7 +65,7 @@ func NewZeroconf(log librespot.Logger, port int, deviceName, deviceId string, de
 
 	// Select the mDNS backend based on configuration
 	if useAvahi {
-		avahiReg, err := NewAvahiRegistrar()
+		avahiReg, err := NewAvahiRegistrar(log)
 		if err != nil {
 			_ = z.listener.Close()
 			return nil, fmt.Errorf("failed initializing avahi registrar: %w", err)
@@ -99,6 +100,14 @@ func NewZeroconf(log librespot.Logger, port int, deviceName, deviceId string, de
 	return z, nil
 }
 
+func (z *Zeroconf) SetDeviceName(name string) {
+	z.deviceName = name
+
+	if err := z.registrar.UpdateName(name); err != nil {
+		z.log.WithError(err).Errorf("failed updating zeroconf service name to %q", name)
+	}
+}
+
 func (z *Zeroconf) SetCurrentUser(username string) {
 	z.userLock.Lock()
 	z.currentUser = username
@@ -108,6 +117,11 @@ func (z *Zeroconf) SetCurrentUser(username string) {
 // Close stops the zeroconf responder and HTTP listener,
 // but does not close the last opened session.
 func (z *Zeroconf) Close() {
+	if z.closed {
+		return
+	}
+
+	z.closed = true
 	z.registrar.Shutdown()
 	_ = z.listener.Close()
 }
@@ -167,6 +181,10 @@ func (z *Zeroconf) handleAddUser(writer http.ResponseWriter, request *http.Reque
 		return fmt.Errorf("invalid client key: %w", err)
 	}
 
+	if len(blob) < 16+1+20 {
+		return fmt.Errorf("invalid blob: too short (%d bytes)", len(blob))
+	}
+
 	// start handshake and decrypting of blob
 	sharedSecret := z.dh.Exchange(clientKey)
 	baseKey := func() []byte { sum := sha1.Sum(sharedSecret); return sum[:16] }()
@@ -198,8 +216,7 @@ func (z *Zeroconf) handleAddUser(writer http.ResponseWriter, request *http.Reque
 
 	z.userLock.Lock()
 
-	// check if we are authenticating the same user that is holding the session
-	if z.currentUser == username || z.authenticatingUser == username {
+	if z.authenticatingUser == username {
 		z.userLock.Unlock()
 
 		writer.WriteHeader(http.StatusOK)
@@ -299,6 +316,10 @@ func (z *Zeroconf) Serve(handler HandleNewRequestFunc) error {
 	for {
 		select {
 		case err := <-serveErr:
+			if z.closed {
+				return nil
+			}
+
 			return err
 		case req := <-z.reqsChan:
 			req.result <- handler(req)

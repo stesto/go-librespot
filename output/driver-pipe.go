@@ -8,7 +8,6 @@ import (
 	"math"
 	"os"
 	"sync"
-	"syscall"
 
 	librespot "github.com/devgianlu/go-librespot"
 )
@@ -32,60 +31,49 @@ type pipeOutput struct {
 	transform func([]float32, []byte) int
 }
 
-func newPipeOutput(opts *NewOutputOptions) (out *pipeOutput, err error) {
-	out = &pipeOutput{
-		reader:         opts.Reader,
-		volume:         opts.InitialVolume,
-		err:            make(chan error, 2),
-		externalVolume: opts.ExternalVolume,
-		volumeUpdate:   opts.VolumeUpdate,
+// Largest float that scales into an int16 without wrapping.
+const maxSampleValueS16 = float32(0x7fff) / float32(0x8000)
+
+func clampSample(f, max float32) float32 {
+	if f < -1 {
+		return -1
 	}
+	if f > max {
+		return max
+	}
+	return f
+}
 
-	out.cond = sync.NewCond(&out.lock)
-
-	switch opts.OutputPipeFormat {
+func newPipeTransform(format string) (func([]float32, []byte) int, error) {
+	switch format {
 	case "s16le":
-		out.transform = func(in []float32, out []byte) int {
+		return func(in []float32, out []byte) int {
 			for i := 0; i < len(in); i++ {
-				sample := int16(in[i] * 32768)
+				sample := int16(clampSample(in[i], maxSampleValueS16) * 32768)
 				binary.LittleEndian.PutUint16(out[i*2:], uint16(sample))
 			}
 			return len(in) * 2
-		}
+		}, nil
 	case "s32le":
-		out.transform = func(in []float32, out []byte) int {
+		// float32 rounds 2147483647 up to 2^31, so scale in float64.
+		return func(in []float32, out []byte) int {
 			for i := 0; i < len(in); i++ {
-				sample := int32(in[i] * 2147483648)
+				sample := int32(float64(clampSample(in[i], 1)) * 2147483647)
 				binary.LittleEndian.PutUint32(out[i*4:], uint32(sample))
 			}
 			return len(in) * 4
-		}
+		}, nil
 	case "f32le":
-		out.transform = func(in []float32, out []byte) int {
+		return func(in []float32, out []byte) int {
 			for i := 0; i < len(in); i++ {
 				sample := math.Float32bits(in[i])
 				binary.LittleEndian.PutUint32(out[i*4:], sample)
 			}
 			return len(in) * 4
-		}
+		}, nil
 	default:
-		return nil, fmt.Errorf("unknown output pipe format: %s", opts.OutputPipeFormat)
+		return nil, fmt.Errorf("unknown output pipe format: %s", format)
 	}
-
-	// Open the FIFO for writing as non-blocking to cause an error if there is no reader.
-	out.file, err = os.OpenFile(opts.OutputPipe, os.O_WRONLY|syscall.O_NONBLOCK, 0)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open fifo: %w", err)
-	}
-
-	// Restore blocking mode now that we are sure we have a reader.
-	if err := syscall.SetNonblock(int(out.file.Fd()), false); err != nil {
-		return nil, fmt.Errorf("failed to set blocking mode on fifo: %w", err)
-	}
-
-	go out.outputLoop()
-
-	return out, nil
 }
 
 func (out *pipeOutput) outputLoop() {

@@ -1,13 +1,40 @@
-# go-librespot
+<h1 align="center">go-librespot</h1>
 
-[![GitHub release](https://img.shields.io/github/release/devgianlu/go-librespot.svg)](https://github.com/devgianlu/go-librespot/releases/latest)
-![GitHub branch check runs](https://img.shields.io/github/check-runs/devgianlu/go-librespot/master)
-[![Go Report Card](https://goreportcard.com/badge/github.com/devgianlu/go-librespot)](https://goreportcard.com/report/github.com/devgianlu/go-librespot)
-[![GitHub License](https://img.shields.io/github/license/devgianlu/go-librespot)](https://github.com/devgianlu/go-librespot/blob/master/LICENSE)
+<p align="center">
+  <em>Yet another open-source Spotify Connect compatible client, written in Go.</em>
+  <br>
+  go-librespot gives you the freedom to have a Spotify Connect device wherever you want.
+</p>
 
-Yet another open-source Spotify Connect compatible client, written in Go.
+<p align="center">
+  <a href="https://github.com/devgianlu/go-librespot/releases/latest"><img alt="GitHub release" src="https://img.shields.io/github/release/devgianlu/go-librespot.svg"></a>
+  <img alt="GitHub branch check runs" src="https://img.shields.io/github/check-runs/devgianlu/go-librespot/master">
+  <a href="https://github.com/devgianlu/go-librespot/blob/master/LICENSE"><img alt="GitHub License" src="https://img.shields.io/github/license/devgianlu/go-librespot"></a>
+</p>
 
-> go-librespot gives you the freedom to have a Spotify Connect device wherever you want.
+<p align="center">
+  <a href="#features">Features</a> •
+  <a href="#getting-started">Getting Started</a> •
+  <a href="#configuration">Configuration</a> •
+  <a href="#development">Development</a>
+</p>
+
+## Features
+
+- 🎵 **Spotify Connect** — show up as a speaker in the Spotify app and stream to it from any device on your network (Spotify Premium required).
+- 🔊 **Multiple audio backends** — ALSA, PulseAudio, AudioToolbox on macOS, WASAPI on Windows, or a raw named pipe for custom routing.
+- 📊 **Loudness normalization** — Spotify-standard −14 LUFS (ITU-R BS.1770) with configurable pregain.
+- 🔀 **Crossfade** — configurable overlap between consecutive tracks.
+- 🎙️ **Podcast resume** — episodes pick up where you left off, and progress syncs back to your other devices.
+- 🎧 **DJ X** — Spotify's AI DJ, narration included: the spoken lines are synthesized and played around each track.
+- 👥 **Jam** — host a Spotify Jam on the speaker and let others join: what they add, skip and pause reaches it, and the song keeps playing through every change.
+- 🎚️ **Flexible volume control** — independent, synchronized with the ALSA mixer, or fully external.
+- 💾 **On-disk audio cache** — skip re-downloading tracks, bounded by an LRU size limit.
+- 🔐 **Multiple login flows** — Zeroconf discovery, interactive OAuth, or a Spotify access token.
+- 📡 **Selectable mDNS backend** — the built-in responder or the system Avahi daemon.
+- 🌐 **REST API + WebSocket events** — control and monitor playback programmatically.
+- 🖥️ **MPRIS integration** — control playback over D-Bus / standard Linux media keys.
+- 🪶 **Lightweight & portable** — a single Go binary, ideal for Raspberry Pi and other embedded devices.
 
 ## Getting Started
 
@@ -40,15 +67,23 @@ brew install go-librespot
 To build from source the following prerequisites are necessary:
 
 - Go 1.25 or higher
-- Libraries: `libogg`, `libvorbis`, `flac`, `libasound2`
+- Libraries: `libogg`, `libvorbis`, `flac`, `mpg123` (plus `libasound2` on Linux)
 
 To install Go, download it from the [Go website](https://go.dev/dl/).
 
 To install the required libraries on Debian-based systems (Debian, Ubuntu, Raspbian), use:
 
 ```shell
-sudo apt-get install libogg-dev libvorbis-dev libflac-dev libasound2-dev
+sudo apt-get install libogg-dev libvorbis-dev libflac-dev libmpg123-dev libasound2-dev
 ```
+
+On Windows the default backend is WASAPI (default playback device). Install the decode libraries as MinGW packages (MSVC `.lib` files will not link with CGO), for example with [MSYS2](https://www.msys2.org/):
+
+```
+pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-pkg-config mingw-w64-x86_64-libogg mingw-w64-x86_64-libvorbis mingw-w64-x86_64-flac mingw-w64-x86_64-mpg123
+```
+
+Cross-compiling a static `windows/amd64` binary with vcpkg is described in [CROSS_COMPILE.md](/CROSS_COMPILE.md).
 
 Once prerequisites are installed you can clone the repository and run the daemon with:
 
@@ -60,8 +95,8 @@ Details about cross-compiling go-librespot are described [here](/CROSS_COMPILE.m
 
 ## Configuration
 
-The default directory for configuration files is `~/.config/go-librespot`. On macOS devices, this is
-`~/Library/Application Support/go-librespot`. You can change this directory with the
+The default directory for configuration files is `~/.config/go-librespot`. On macOS this is
+`~/Library/Application Support/go-librespot`. On Windows it is `%APPDATA%\go-librespot`. You can change this directory with the
 `-config_dir` flag. The configuration directory contains:
 
 - `config.yml`: The main configuration (does not exist by default)
@@ -140,6 +175,27 @@ requires some manual steps to complete the authentication:
    curl http://127.0.0.1:36842/login?code=xxxxxxxx
    ```
 
+### Device authorization mode
+
+This mode associates your account with the device without a browser on the device itself: Spotify issues a short code
+which you enter at [spotify.com/pair](https://spotify.com/pair) from a phone or computer. Nothing has to listen on a
+port, so unlike interactive mode there is no redirect URL to copy around when go-librespot runs headless.
+
+1. Configure device authorization mode
+
+    ```yaml
+    zeroconf_enabled: false # Whether to keep the device discoverable at all times
+    credentials:
+      type: device_auth
+    ```
+
+2. Start the daemon to begin the authentication flow
+3. Open the link it logs, or go to [spotify.com/pair](https://spotify.com/pair) and enter the code it prints
+4. Approve the request; the daemon picks it up automatically and stores the credentials
+
+With the API server enabled, the same link and code are also served at `GET /auth/code` for as long as the daemon is
+waiting, so a frontend can show them instead of asking the user to read the logs.
+
 ### API server
 
 Optionally, an API server can be started to control and monitor the player. To enable this feature, add the following to
@@ -157,6 +213,36 @@ server:
 ```
 
 For detailed API documentation see [here](/API.md).
+
+### Audio cache
+
+Downloaded audio files can be cached on disk so that replaying a track does not download it again from the CDN. Only the
+raw, still-encrypted files are stored: a cached file is useless without a valid Spotify account, since the audio key is
+retrieved again on every playback. The cache is disabled by default; once enabled it applies a 1 GB limit, after which the
+least-recently-used files are evicted.
+
+```yaml
+cache:
+  enabled: false # Whether to cache downloaded audio files (default: false)
+  dir: '' # Directory for cached files (default: the XDG cache directory, e.g. $XDG_CACHE_HOME/go-librespot or $HOME/.cache/go-librespot)
+  size_limit: '1GB' # Maximum total cache size before evicting least-recently-used files ('0' for unlimited)
+```
+
+### Track metadata cache
+
+Optionally, the daemon can cache track metadata (name, artists, cover art) in memory and fetch it — via the same
+internal API playback uses, not the rate-limited public Web API — for the tracks around the playback position. This
+enables a `next_track` field in `GET /status` and a `GET /context/tracks?uri=...` endpoint that lists any playable
+context (playlist, album, artist) in order with metadata, so a client can render a browsable song list and start any
+entry via `POST /player/play` with `skip_to_uri`. Everything is opt-in and disabled by default: a headless speaker has
+no use for metadata beyond the playing track and should not pay network requests for it.
+
+```yaml
+metadata:
+  enabled: false # Cache + fetch metadata around the playback position; enables next_track and /context/tracks
+  context_sweep: false # Also resolve metadata for the whole context when one starts playing (requires enabled)
+  max_tracks: 800 # Maximum number of tracks of a context to enumerate and sweep
+```
 
 ### Volume synchronization
 
@@ -194,26 +280,27 @@ The pregain is applied on Spotify's -14 dB LUFS target. Spotify suggests the fol
 
 ### Handling volume externally
 
-To sync the go-librespot volume over TCP to an external service, which can be useful if you control your main volume externally, the following options can be used:
-````yaml
-external_volume: true # disables librespots internal volume
+To sync the go-librespot volume over TCP to an external service, which can be useful if you control your main volume externally, use the following options:
+
+```yaml
+external_volume: true # disables go-librespot's internal volume
 volume_over_tcp:
   enabled: true
   address: localhost # Which address to bind the volume listener to
   port: 3679 # The port for the volume listener
   service_address: localhost # Which address to connect to for getting and setting the volume
   service_port: 55550 # Which port to connect to for getting and setting the volume
-````
+```
 
-When enabled, librespot will connect to the given service address and port everytime it needs to know the current volume or set a new volume (which happens when the user changed it through the Spotify UI).
+When enabled, go-librespot connects to the given service address and port whenever it needs to read the current volume or report a new volume (for example, after the user changes it through the Spotify UI).
 
 Your service needs to set up a TCP server listening on your configured `service_address` and `service_port`.
 
-When requesting your current external volume, librespot connects to your service, sends exactly 1 byte with the value `0x00`, waits for the response of exactly one byte with your external volume mapped from `0..255` and destroys the connection.
+When requesting the current external volume, go-librespot connects to your service, sends exactly one byte with the value `0x00`, waits for a response of exactly one byte with the external volume mapped from `0..255`, and closes the connection.
 
-When setting the volume, librespot connects to your service, sends exactly 2 bytes with the first byte being `0x01` and the second byte being the new volume mapped from `0..255` and destroys the connection.
+When setting the volume, go-librespot connects to your service, sends exactly two bytes—the first byte is `0x01` and the second is the new volume mapped from `0..255`—and closes the connection.
 
-When your service wants to notify librespot (and the users UI) that the volume has changed externally, your service can connect to the configured `address` and `port`, send exactly 1 byte with the volume mapped from `0..255` and destroy the connection.
+When your service needs to notify go-librespot (and the user's UI) that the volume changed externally, it can connect to the configured `address` and `port`, send exactly one byte with the volume mapped from `0..255`, and close the connection.
 
 ### Additional configuration
 
@@ -225,7 +312,8 @@ log_disable_timestamp: false # Whether to disable timestamps in log output
 device_id: '' # Spotify device ID (auto-generated)
 device_name: '' # Spotify device name
 device_type: computer # Spotify device type (icon)
-audio_backend: alsa # Audio backend to use (alsa, pipe, pulseaudio)
+audio_backend: alsa # Default: audio-toolbox on macOS, wasapi on Windows, alsa elsewhere. Can also use pipe or pulseaudio.
+audio_backend_runtime_socket: '' # Audio backends' runtime socket to use, if backend is pulseaudio
 audio_device: default # ALSA audio device to use for playback
 mixer_device: '' # ALSA mixer device for volume synchronization 
 mixer_control_name: Master # ALSA mixer control name for volume synchronization
@@ -233,13 +321,28 @@ audio_buffer_time: 500000 # Audio buffer time in microseconds, ALSA only
 audio_period_count: 4 # Number of periods to request, ALSA only
 audio_output_pipe: '' # Path to a named pipe for audio output
 audio_output_pipe_format: s16le # Audio output pipe format (s16le, s32le, f32le)
+audio_output_pipe_wait_for_reader: false # Whether to wait for a reader to connect to the FIFO before starting playback (see below)
 bitrate: 160 # Playback bitrate (96, 160, 320)
+crossfade_duration: 0 # Crossfade duration between tracks in milliseconds (0 to disable)
+skip_debounce_ms: 600 # Coalesce rapid next/prev presses; the selected track loads once presses stop (0 to disable)
 volume_steps: 100 # Volume steps count
 initial_volume: 100 # Initial volume in steps (not applied to the mixer device)
 ignore_last_volume: false # Whether to ignore the last saved volume and always use initial_volume
 external_volume: false # Whether volume is controlled externally 
 disable_autoplay: false # Whether autoplay of more songs should be disabled
+prefer_firewall_friendly_ports: false # Whether to try accesspoints on 443 and 80 before the default 4070
 ```
+
+If your network only allows outbound HTTP and HTTPS, set
+`prefer_firewall_friendly_ports: true`. Spotify offers each accesspoint on
+4070, 443 and 80 and normally lists 4070 first, which restrictive firewalls
+tend to block; enabling this tries 443 first, then 80, and falls back to 4070.
+The dealer and spclient are unaffected, as they already use 443.
+
+With the pipe backend, opening the FIFO fails if no reader is connected when
+playback starts. Some readers (e.g. snapcast with `dryout_ms`) only connect to
+the FIFO when they expect data. Set `audio_output_pipe_wait_for_reader: true`
+to instead wait for a reader to appear before starting playback.
 
 Make sure to check [here](/config_schema.json) for the full list of options.
 
