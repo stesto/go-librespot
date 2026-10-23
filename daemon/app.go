@@ -44,7 +44,7 @@ type App struct {
 	logoutCh chan *AppPlayer
 
 	audioCache *cache.Cache
-	volumeTCP  *tcpVolumeBridge
+	volumeMQTT *mqttVolumeBridge
 
 	// metaCache and contextLists back the opt-in metadata features. They live
 	// here rather than on the player so that a session swap (logout, a new
@@ -163,7 +163,7 @@ func New(opts *Options) (*App, error) {
 		app.contextLists = newContextListCache()
 	}
 
-	app.volumeTCP, err = newTCPVolumeBridge(app.cfg.VolumeTCP, app.log)
+	app.volumeMQTT, err = newMQTTVolumeBridge(app.cfg.VolumeMQTT, app.log)
 	if err != nil {
 		return nil, fmt.Errorf("failed initializing external volume bridge: %w", err)
 	}
@@ -231,8 +231,8 @@ func (app *App) Close() error {
 	if app.zeroconf != nil {
 		app.zeroconf.Close()
 	}
-	if app.volumeTCP != nil {
-		if err := app.volumeTCP.Close(); err != nil {
+	if app.volumeMQTT != nil {
+		if err := app.volumeMQTT.Close(); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -327,14 +327,14 @@ func (app *App) newAppPlayer(ctx context.Context, creds any) (_ *AppPlayer, err 
 	}
 
 	appPlayer.initState()
-	if app.volumeTCP != nil {
+	if app.volumeMQTT != nil {
 		initialVolume := uint32(player.MaxStateVolume)
 		if app.cfg.VolumeSteps > 0 {
 			initialVolume = app.cfg.InitialVolume * player.MaxStateVolume / app.cfg.VolumeSteps
 		}
-		if volume, ok := app.volumeTCP.getVolume(volumeTCPGetTimeout); ok {
+		if volume, ok := app.volumeMQTT.getVolume(volumeMQTTInitialTimeout); ok {
 			initialVolume = volume
-			app.log.Debugf("fetched external volume once: %d", volume)
+			app.log.Debugf("initialized volume from MQTT: %d", volume)
 		}
 		if initialVolume > player.MaxStateVolume {
 			initialVolume = player.MaxStateVolume

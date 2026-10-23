@@ -56,18 +56,19 @@ type Config struct {
 
 	Metadata MetadataConfig
 
-	VolumeTCP VolumeTCPConfig
+	VolumeMQTT VolumeMQTTConfig
 
 	Credentials CredentialsConfig
 }
 
-// VolumeTCPConfig configures synchronization with an external volume service.
-type VolumeTCPConfig struct {
-	Enabled        bool
-	Address        string
-	Port           int
-	ServiceAddress string
-	ServicePort    int
+// VolumeMQTTConfig configures external volume synchronization over MQTT.
+// ReadTopic carries acknowledged percentages (0..100); SetTopic accepts commands.
+type VolumeMQTTConfig struct {
+	Enabled   bool
+	Host      string
+	Port      int
+	ReadTopic string
+	SetTopic  string
 }
 
 // MetadataConfig configures the in-memory track metadata cache behind the

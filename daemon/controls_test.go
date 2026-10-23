@@ -8,8 +8,10 @@ import (
 
 	librespot "github.com/devgianlu/go-librespot"
 	"github.com/devgianlu/go-librespot/player"
+	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 )
 
 // The first press of a burst loads at once, so a lone skip is as quick as it
@@ -111,4 +113,49 @@ func TestVolumeFromApi(t *testing.T) {
 			require.Equal(t, tc.want, app.volumeFromApi(tc.data, current))
 		})
 	}
+}
+
+func TestMQTTVolumeWithoutSession(t *testing.T) {
+	app, saves := newVolumeTestApp(t, &Config{VolumeSteps: 100, InitialVolume: 10}, nil)
+	app.volumeMQTT = &mqttVolumeBridge{
+		log:      app.log,
+		updates:  make(chan uint32, 1),
+		commands: make(chan uint32, 1),
+		ready:    make(chan struct{}),
+	}
+	app.volumeMQTT.receiveVolume([]byte("30"))
+	require.Equal(t, uint32(30), app.volumeWithoutSession().Value)
+	app.setVolumeWithoutSession(ApiSetVolume{Volume: 5, Relative: true})
+	require.Equal(t, uint32(player.MaxStateVolume*35/100), <-app.volumeMQTT.commands)
+	requireSaved(t, saves, player.MaxStateVolume*35/100)
+	// A command is not an acknowledgment; the external state stays at 30%.
+	require.Equal(t, uint32(30), app.volumeWithoutSession().Value)
+	app.volumeMQTT.receiveVolume([]byte("35"))
+	require.Equal(t, uint32(35), app.volumeWithoutSession().Value)
+}
+
+func TestMQTTVolumePublishesToSpotifyWithoutEcho(t *testing.T) {
+	p := newTestAppPlayer(t)
+	app, saves := newVolumeTestApp(t, &Config{VolumeSteps: 100}, nil)
+	app.server = p.app.server
+	app.volumeMQTT = &mqttVolumeBridge{commands: make(chan uint32, 1)}
+	p.app = app
+	p.volumeUpdate = make(chan float32, 1)
+	volume := uint32(49151)
+	require.True(t, p.externalVolumeUpdated(volume))
+	requireSaved(t, saves, volume)
+	require.False(t, p.externalVolumeUpdated(volume), "duplicate acknowledgments need no new notification")
+
+	// The debounced player-loop notification still reaches both Connect and
+	// the events API, without enqueuing a second external volume command.
+	p.volumeUpdated()
+	pushes := drain(p.statePush)
+	require.NotEmpty(t, pushes)
+	var state connectpb.PutStateRequest
+	require.NoError(t, proto.Unmarshal(pushes[len(pushes)-1].body, &state))
+	require.Equal(t, connectpb.PutStateReason_VOLUME_CHANGED, state.PutStateReason)
+	require.Equal(t, volume, state.Device.DeviceInfo.Volume)
+	require.Contains(t, apiEvents(p), ApiEventTypeVolume)
+	require.Empty(t, app.volumeMQTT.commands)
+	require.Empty(t, p.volumeUpdate)
 }

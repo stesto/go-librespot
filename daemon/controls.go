@@ -1665,6 +1665,9 @@ func (app *App) setVolumeWithoutSession(data ApiSetVolume) {
 	newVal := app.volumeFromApi(data, app.sessionVolume())
 	app.log.Debugf("volume set to %d/%d without a session", newVal, player.MaxStateVolume)
 	app.setVolume(newVal)
+	if app.volumeMQTT != nil {
+		app.volumeMQTT.setVolume(newVal)
+	}
 }
 
 // volumeWithoutSession answers a volume request while there is no session with
@@ -1673,10 +1676,15 @@ func (app *App) volumeWithoutSession() *ApiVolume {
 	return &ApiVolume{Max: app.cfg.VolumeSteps, Value: app.volumeSteps(app.sessionVolume())}
 }
 
-// sessionVolume is the volume a session starts at when the volume is external:
-// the last one set while this process runs, else the one saved by an earlier
-// run unless ignore_last_volume is set, else initial_volume.
+// sessionVolume starts with the acknowledged MQTT volume, when available,
+// otherwise the last one set while this process runs, the saved volume unless
+// ignore_last_volume is set, or initial_volume.
 func (app *App) sessionVolume() uint32 {
+	if app.volumeMQTT != nil {
+		if volume, ok := app.volumeMQTT.currentVolume(); ok {
+			return volume
+		}
+	}
 	app.stateMu.Lock()
 	defer app.stateMu.Unlock()
 
@@ -1715,6 +1723,17 @@ func (p *AppPlayer) volumeUpdated() {
 			Max:   p.app.cfg.VolumeSteps,
 		},
 	})
+}
+
+// externalVolumeUpdated records an acknowledged value without calling
+// updateVolume, which would send a command back to the external controller.
+func (p *AppPlayer) externalVolumeUpdated(volume uint32) bool {
+	if p.state.device.Volume == volume {
+		return false
+	}
+	p.state.device.Volume = volume
+	p.app.setVolume(volume)
+	return true
 }
 
 func (p *AppPlayer) stopPlayback() {

@@ -66,21 +66,48 @@ func TestSkipDebounceMapping(t *testing.T) {
 	require.Zero(t, c.toDaemonConfig().SkipDebounce)
 }
 
-func TestVolumeTCPMapping(t *testing.T) {
-	c := cliConfig{VolumeTCP: volumeTCPCLIConfig{
-		Enabled:        true,
-		Address:        "127.0.0.1",
-		Port:           3679,
-		ServiceAddress: "127.0.0.2",
-		ServicePort:    55550,
+func TestVolumeMQTTMapping(t *testing.T) {
+	c := cliConfig{VolumeMQTT: volumeMQTTCLIConfig{
+		Enabled:   true,
+		Host:      "broker.example",
+		Port:      1884,
+		ReadTopic: "speaker/volume",
+		SetTopic:  "speaker/volume/set",
 	}}
 
-	got := c.toDaemonConfig().VolumeTCP
+	got := c.toDaemonConfig().VolumeMQTT
 	require.True(t, got.Enabled)
-	require.Equal(t, "127.0.0.1", got.Address)
-	require.Equal(t, 3679, got.Port)
-	require.Equal(t, "127.0.0.2", got.ServiceAddress)
-	require.Equal(t, 55550, got.ServicePort)
+	require.Equal(t, "broker.example", got.Host)
+	require.Equal(t, 1884, got.Port)
+	require.Equal(t, "speaker/volume", got.ReadTopic)
+	require.Equal(t, "speaker/volume/set", got.SetTopic)
+}
+
+func TestLoadCLIConfigVolumeMQTT(t *testing.T) {
+	for _, tc := range []struct {
+		name, config, host, readTopic, setTopic string
+		port                                    int
+	}{
+		{"defaults", "volume_over_mqtt:\n  enabled: true\n", "mqtt.home", "minidsp_dev/911111/Master/Volume", "minidsp_dev/911111/Master/Volume/set", 1883},
+		{"custom", "volume_over_mqtt:\n  enabled: true\n  host: example.home\n  port: 1884\n  read_topic: speaker/volume\n  set_topic: speaker/volume/set\n", "example.home", "speaker/volume", "speaker/volume/set", 1884},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "config.yml"), []byte(tc.config), 0o600))
+			oldArgs := os.Args
+			t.Cleanup(func() { os.Args = oldArgs })
+			os.Args = []string{"test", "--config_dir", dir}
+			cfg := new(cliConfig)
+			require.NoError(t, loadCLIConfig(cfg))
+			t.Cleanup(func() { require.NoError(t, cfg.configLock.Unlock()) })
+			mqtt := cfg.toDaemonConfig().VolumeMQTT
+			require.True(t, mqtt.Enabled)
+			require.Equal(t, tc.host, mqtt.Host)
+			require.Equal(t, tc.port, mqtt.Port)
+			require.Equal(t, tc.readTopic, mqtt.ReadTopic)
+			require.Equal(t, tc.setTopic, mqtt.SetTopic)
+		})
+	}
 }
 
 func TestParseSize(t *testing.T) {

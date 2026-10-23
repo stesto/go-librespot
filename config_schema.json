@@ -347,33 +347,39 @@
           "description": "Whether FLAC files should be preferred over other formats when available",
           "default": false
         },
-        "volume_over_tcp": {
+        "volume_over_mqtt": {
           "type": "object",
+          "additionalProperties": false,
           "properties": {
             "enabled": {
               "type": "boolean",
-              "description": "Whether the volume should be synchronized with an external TCP service. Set external_volume to true to disable go-librespot's internal volume",
+              "description": "Whether to synchronize volume over MQTT. Set external_volume to true to disable go-librespot's internal volume",
               "default": false
             },
-            "address": {
+            "host": {
               "type": "string",
-              "description": "Which address to bind for the volume server",
-              "default": "localhost"
+              "description": "MQTT broker hostname or IP address, without a URL scheme",
+              "default": "mqtt.home",
+              "minLength": 1
             },
             "port": {
               "type": "integer",
-              "description": "Which port to bind for the volume server",
-              "default": 0
+              "description": "MQTT broker port",
+              "default": 1883,
+              "minimum": 1,
+              "maximum": 65535
             },
-            "service_address": {
+            "read_topic": {
               "type": "string",
-              "description": "Which address to connect to for getting and setting the volume",
-              "default": ""
+              "description": "Topic carrying the current/acknowledged volume as a plain-text percentage from 0 to 100. Retain the value for initialization",
+              "default": "minidsp_dev/911111/Master/Volume",
+              "minLength": 1
             },
-            "service_port": {
-              "type": "integer",
-              "description": "Which port to connect to for getting and setting the volume",
-              "default": 0
+            "set_topic": {
+              "type": "string",
+              "description": "Topic to publish volume commands as plain-text percentages from 0 to 100",
+              "default": "minidsp_dev/911111/Master/Volume/set",
+              "minLength": 1
             }
           }
         },

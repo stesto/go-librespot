@@ -1115,9 +1115,9 @@ func (p *AppPlayer) Run(apiRecv <-chan ApiRequest, mprisRecv <-chan mpris.MediaP
 
 	volumeTimer := time.NewTimer(time.Minute)
 	volumeTimer.Stop() // don't emit a volume change event at start
-	var volumeTCPUpdates <-chan uint32
-	if p.app.volumeTCP != nil {
-		volumeTCPUpdates = p.app.volumeTCP.updates
+	var volumeMQTTUpdates <-chan uint32
+	if p.app.volumeMQTT != nil {
+		volumeMQTTUpdates = p.app.volumeMQTT.updates
 	}
 
 	// The accesspoint and the dealer only close their receivers after giving
@@ -1247,15 +1247,14 @@ func (p *AppPlayer) Run(apiRecv <-chan ApiRequest, mprisRecv <-chan mpris.MediaP
 			// limit them (otherwise we get HTTP error 429: Too many requests
 			// for user).
 			p.state.device.Volume = uint32(math.Round(float64(volume * player.MaxStateVolume)))
-			if p.app.volumeTCP != nil {
-				p.app.volumeTCP.setVolume(p.state.device.Volume, volumeTCPSetTimeout)
+			if p.app.volumeMQTT != nil {
+				p.app.volumeMQTT.setVolume(p.state.device.Volume)
 			}
 			volumeTimer.Reset(100 * time.Millisecond)
-		case volume := <-volumeTCPUpdates:
+		case volume := <-volumeMQTTUpdates:
 			// An external change is already at the system's volume control, so
 			// publish it to Spotify without sending it back to the service.
-			if p.state.device.Volume != volume {
-				p.state.device.Volume = volume
+			if p.externalVolumeUpdated(volume) {
 				volumeTimer.Reset(100 * time.Millisecond)
 			}
 		case <-volumeTimer.C:

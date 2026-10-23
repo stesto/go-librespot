@@ -48,25 +48,26 @@ type cliConfig struct {
 	AudioOutputPipeFormat        string `koanf:"audio_output_pipe_format"`
 	AudioOutputPipeWaitForReader bool   `koanf:"audio_output_pipe_wait_for_reader"`
 
-	Bitrate                       int                `koanf:"bitrate"`
-	VolumeSteps                   uint32             `koanf:"volume_steps"`
-	InitialVolume                 uint32             `koanf:"initial_volume"`
-	IgnoreLastVolume              bool               `koanf:"ignore_last_volume"`
-	NormalisationDisabled         bool               `koanf:"normalisation_disabled"`
-	NormalisationUseAlbumGain     bool               `koanf:"normalisation_use_album_gain"`
-	NormalisationPregain          float32            `koanf:"normalisation_pregain"`
-	CrossfadeDuration             int                `koanf:"crossfade_duration"`
-	SkipDebounceMs                int                `koanf:"skip_debounce_ms"`
-	ExternalVolume                bool               `koanf:"external_volume"`
-	ZeroconfEnabled               bool               `koanf:"zeroconf_enabled"`
-	ZeroconfPort                  int                `koanf:"zeroconf_port"`
-	ZeroconfBackend               string             `koanf:"zeroconf_backend"`
-	DisableAutoplay               bool               `koanf:"disable_autoplay"`
-	ZeroconfInterfacesToAdvertise []string           `koanf:"zeroconf_interfaces_to_advertise"`
-	MprisEnabled                  bool               `koanf:"mpris_enabled"`
-	FlacEnabled                   bool               `koanf:"flac_enabled"`
-	PreferFirewallFriendlyPorts   bool               `koanf:"prefer_firewall_friendly_ports"`
-	VolumeTCP                     volumeTCPCLIConfig `koanf:"volume_over_tcp"`
+	Bitrate                       int      `koanf:"bitrate"`
+	VolumeSteps                   uint32   `koanf:"volume_steps"`
+	InitialVolume                 uint32   `koanf:"initial_volume"`
+	IgnoreLastVolume              bool     `koanf:"ignore_last_volume"`
+	NormalisationDisabled         bool     `koanf:"normalisation_disabled"`
+	NormalisationUseAlbumGain     bool     `koanf:"normalisation_use_album_gain"`
+	NormalisationPregain          float32  `koanf:"normalisation_pregain"`
+	CrossfadeDuration             int      `koanf:"crossfade_duration"`
+	SkipDebounceMs                int      `koanf:"skip_debounce_ms"`
+	ExternalVolume                bool     `koanf:"external_volume"`
+	ZeroconfEnabled               bool     `koanf:"zeroconf_enabled"`
+	ZeroconfPort                  int      `koanf:"zeroconf_port"`
+	ZeroconfBackend               string   `koanf:"zeroconf_backend"`
+	DisableAutoplay               bool     `koanf:"disable_autoplay"`
+	ZeroconfInterfacesToAdvertise []string `koanf:"zeroconf_interfaces_to_advertise"`
+	MprisEnabled                  bool     `koanf:"mpris_enabled"`
+	FlacEnabled                   bool     `koanf:"flac_enabled"`
+	PreferFirewallFriendlyPorts   bool     `koanf:"prefer_firewall_friendly_ports"`
+
+	VolumeMQTT volumeMQTTCLIConfig `koanf:"volume_over_mqtt"`
 
 	Server struct {
 		Enabled     bool   `koanf:"enabled"`
@@ -106,12 +107,12 @@ type cliConfig struct {
 	} `koanf:"credentials"`
 }
 
-type volumeTCPCLIConfig struct {
-	Enabled        bool   `koanf:"enabled"`
-	Address        string `koanf:"address"`
-	Port           int    `koanf:"port"`
-	ServiceAddress string `koanf:"service_address"`
-	ServicePort    int    `koanf:"service_port"`
+type volumeMQTTCLIConfig struct {
+	Enabled   bool   `koanf:"enabled"`
+	Host      string `koanf:"host"`
+	Port      int    `koanf:"port"`
+	ReadTopic string `koanf:"read_topic"`
+	SetTopic  string `koanf:"set_topic"`
 }
 
 func (c *cliConfig) toDaemonConfig() *daemon.Config {
@@ -154,12 +155,12 @@ func (c *cliConfig) toDaemonConfig() *daemon.Config {
 
 		PreferFirewallFriendlyPorts: c.PreferFirewallFriendlyPorts,
 
-		VolumeTCP: daemon.VolumeTCPConfig{
-			Enabled:        c.VolumeTCP.Enabled,
-			Address:        c.VolumeTCP.Address,
-			Port:           c.VolumeTCP.Port,
-			ServiceAddress: c.VolumeTCP.ServiceAddress,
-			ServicePort:    c.VolumeTCP.ServicePort,
+		VolumeMQTT: daemon.VolumeMQTTConfig{
+			Enabled:   c.VolumeMQTT.Enabled,
+			Host:      c.VolumeMQTT.Host,
+			Port:      c.VolumeMQTT.Port,
+			ReadTopic: c.VolumeMQTT.ReadTopic,
+			SetTopic:  c.VolumeMQTT.SetTopic,
 		},
 	}
 	dc.Cache.Enabled = c.Cache.Enabled
@@ -250,7 +251,10 @@ func loadCLIConfig(cfg *cliConfig) error {
 		"server.address":    "localhost",
 		"server.image_size": "default",
 
-		"volume_over_tcp.address": "localhost",
+		"volume_over_mqtt.host":       "mqtt.home",
+		"volume_over_mqtt.port":       1883,
+		"volume_over_mqtt.read_topic": "minidsp_dev/911111/Master/Volume",
+		"volume_over_mqtt.set_topic":  "minidsp_dev/911111/Master/Volume/set",
 	}, "."), nil)
 
 	var configPath string

@@ -281,27 +281,25 @@ The pregain is applied on Spotify's -14 dB LUFS target. Spotify suggests the fol
 
 ### Handling volume externally
 
-To sync the go-librespot volume over TCP to an external service, which can be useful if you control your main volume externally, use the following options:
+To synchronize volume with an external controller over MQTT, use the following options:
 
 ```yaml
 external_volume: true # disables go-librespot's internal volume
-volume_over_tcp:
+volume_over_mqtt:
   enabled: true
-  address: localhost # Which address to bind the volume listener to
-  port: 3679 # The port for the volume listener
-  service_address: localhost # Which address to connect to for getting and setting the volume
-  service_port: 55550 # Which port to connect to for getting and setting the volume
+  host: mqtt.home # MQTT broker hostname or IP address, without http://
+  port: 1883
+  read_topic: minidsp_dev/911111/Master/Volume
+  set_topic: minidsp_dev/911111/Master/Volume/set
 ```
 
-When enabled, go-librespot connects to the given service address and port whenever it needs to read the current volume or report a new volume (for example, after the user changes it through the Spotify UI).
+Payloads are plain-text percentage numbers between `0` and `100`, including decimals (for example, `37.5`). These percentages are independent of `volume_steps`.
 
-Your service needs to set up a TCP server listening on your configured `service_address` and `service_port`.
+go-librespot subscribes to `read_topic` for the current/acknowledged volume. Publish the current value as a **retained** message so it is available immediately when go-librespot starts or reconnects. MQTT has no request to fetch a topic's value: without a retained value, go-librespot waits for the next update and uses `initial_volume` until one arrives.
 
-When requesting the current external volume, go-librespot connects to your service, sends exactly one byte with the value `0x00`, waits for a response of exactly one byte with the external volume mapped from `0..255`, and closes the connection.
+Volume changes requested through Spotify, the REST API, or MPRIS are published to `set_topic` with QoS 1 and without retention. The external controller should apply the command and publish its acknowledged value to `read_topic`.
 
-When setting the volume, go-librespot connects to your service, sends exactly two bytes—the first byte is `0x01` and the second is the new volume mapped from `0..255`—and closes the connection.
-
-When your service needs to notify go-librespot (and the user's UI) that the volume changed externally, it can connect to the configured `address` and `port`, send exactly one byte with the volume mapped from `0..255`, and close the connection.
+Updates received on `read_topic` are reflected in Spotify Connect clients and the events API without being echoed to `set_topic`. Invalid payloads are ignored. The MQTT connection automatically reconnects and restores the subscription after an interruption.
 
 ### Additional configuration
 
