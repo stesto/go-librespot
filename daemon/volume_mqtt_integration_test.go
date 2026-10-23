@@ -4,6 +4,7 @@ package daemon
 
 import (
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"strconv"
@@ -59,13 +60,13 @@ func TestMQTTVolumeLiveBroker(t *testing.T) {
 	})
 	require.True(t, token.WaitTimeout(5*time.Second))
 	require.NoError(t, token.Error())
-	// Reapply the current value to test delivery without moving the volume.
+	// Reapply the current value rounded to a whole percentage.
 	bridge.setVolume(volume)
 	select {
 	case payload := <-commands:
-		percentage, err := strconv.ParseFloat(payload, 64)
+		percentage, err := strconv.Atoi(payload)
 		require.NoError(t, err)
-		require.InDelta(t, float64(volume)*100/float64(volumeMQTTMaxVolume), percentage, 0.01)
+		require.Equal(t, int(math.Round(float64(volume)*100/float64(volumeMQTTMaxVolume))), percentage)
 		t.Logf("observed command on %s: %s", cfg.SetTopic, payload)
 	case <-time.After(5 * time.Second):
 		t.Fatal("MQTT volume command was not observed")

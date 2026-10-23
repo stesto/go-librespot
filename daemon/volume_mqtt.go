@@ -176,10 +176,10 @@ func (b *mqttVolumeBridge) publishCommands() {
 		case <-b.done:
 			return
 		case volume := <-b.commands:
-			percentage := math.Round(float64(volume)*10000/float64(volumeMQTTMaxVolume)) / 100
+			percentage := uint64(math.Round(float64(volume) * 100 / float64(volumeMQTTMaxVolume)))
 			// Commands are deliberately not retained: reconnecting a controller
 			// must not replay a stale set request. QoS 1 acknowledges delivery.
-			token := b.client.Publish(b.setTopic, 1, false, strconv.FormatFloat(percentage, 'f', -1, 64))
+			token := b.client.Publish(b.setTopic, 1, false, strconv.FormatUint(percentage, 10))
 			select {
 			case <-token.Done():
 				if err := token.Error(); err != nil {

@@ -140,6 +140,31 @@ func TestMQTTVolumePayloadValidationAndLatestValue(t *testing.T) {
 	require.Equal(t, volumeMQTTMaxVolume, <-bridge.updates, "only the latest external update should wait for a session")
 }
 
+func TestMQTTVolumeCommandsRoundToIntegers(t *testing.T) {
+	bridge, listener := newVolumeMQTTTestBridge(t)
+	conn := acceptVolumeMQTTClient(t, listener)
+	for _, tc := range []struct {
+		volume uint32
+		want   string
+	}{
+		{0, "0"},
+		{24569, "37"},  // 37.49% rounds down.
+		{24576, "38"},  // 37.50% rounds up.
+		{65273, "100"}, // 99.60% rounds to the upper bound.
+		{volumeMQTTMaxVolume, "100"},
+	} {
+		bridge.setVolume(tc.volume)
+		packet, err := packets.ReadPacket(conn)
+		require.NoError(t, err)
+		command, ok := packet.(*packets.PublishPacket)
+		require.True(t, ok, "expected PUBLISH, got %T", packet)
+		require.Equal(t, tc.want, string(command.Payload))
+		ack := packets.NewControlPacket(packets.Puback).(*packets.PubackPacket)
+		ack.MessageID = command.MessageID
+		require.NoError(t, ack.Write(conn))
+	}
+}
+
 func TestMQTTVolumeBridgeDisabledAndInvalidConfig(t *testing.T) {
 	bridge, err := newMQTTVolumeBridge(VolumeMQTTConfig{}, &librespot.NullLogger{})
 	require.NoError(t, err)

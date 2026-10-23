@@ -377,7 +377,7 @@
             },
             "set_topic": {
               "type": "string",
-              "description": "Topic to publish volume commands as plain-text percentages from 0 to 100",
+              "description": "Topic to publish volume commands as plain-text integer percentages from 0 to 100, rounded to the nearest integer",
               "default": "minidsp_dev/911111/Master/Volume/set",
               "minLength": 1
             }

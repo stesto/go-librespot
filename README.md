@@ -293,13 +293,13 @@ volume_over_mqtt:
   set_topic: minidsp_dev/911111/Master/Volume/set
 ```
 
-Payloads are plain-text percentage numbers between `0` and `100`, including decimals (for example, `37.5`). These percentages are independent of `volume_steps`.
+Payloads are plain-text percentage numbers between `0` and `100`. Incoming values may include decimals (for example, `37.5`); outgoing set commands are rounded to the nearest integer. These percentages are independent of `volume_steps`.
 
 go-librespot subscribes to `read_topic` for the current/acknowledged volume. Publish the current value as a **retained** message so it is available immediately when go-librespot starts or reconnects. MQTT has no request to fetch a topic's value: without a retained value, go-librespot waits for the next update and uses `initial_volume` until one arrives.
 
 Volume changes requested through Spotify, the REST API, or MPRIS are published to `set_topic` with QoS 1 and without retention. The external controller should apply the command and publish its acknowledged value to `read_topic`.
 
-Updates received on `read_topic` are reflected in Spotify Connect clients and the events API without being echoed to `set_topic`. Invalid payloads are ignored. The MQTT connection automatically reconnects and restores the subscription after an interruption.
+Updates received on `read_topic` are reflected in Spotify Connect clients and the events API without being echoed to `set_topic`. Volume notifications are debounced: each volume event restarts a one-second timer, and only the latest value is published after one second without another event. Invalid payloads are ignored. The MQTT connection automatically reconnects and restores the subscription after an interruption.
 
 ### Additional configuration
 
