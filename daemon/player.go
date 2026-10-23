@@ -1251,14 +1251,14 @@ func (p *AppPlayer) Run(apiRecv <-chan ApiRequest, mprisRecv <-chan mpris.MediaP
 			if p.app.volumeMQTT != nil {
 				p.app.volumeMQTT.setVolume(p.state.device.Volume)
 			}
-			volumeTimer.Reset(time.Second)
+			volumeTimer.Reset(500 * time.Millisecond)
 		case volume := <-volumeMQTTUpdates:
 			// An external change is already at the system's volume control, so
 			// publish it to Spotify without sending it back to the service.
 			p.externalVolumeUpdated(volume)
 			// Every incoming event, including a repeated value, restarts the
-			// quiet period. Publish only the latest volume after one second.
-			volumeTimer.Reset(time.Second)
+			// quiet period. Publish only the latest volume after 500 ms.
+			volumeTimer.Reset(500 * time.Millisecond)
 		case <-volumeTimer.C:
 			// We've gone some time without update, send the new value now.
 			p.volumeUpdated()

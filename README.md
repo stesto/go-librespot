@@ -299,7 +299,7 @@ go-librespot subscribes to `read_topic` for the current/acknowledged volume. Pub
 
 Volume changes requested through Spotify, the REST API, or MPRIS are published to `set_topic` with QoS 1 and without retention. The external controller should apply the command and publish its acknowledged value to `read_topic`.
 
-Updates received on `read_topic` are reflected in Spotify Connect clients and the events API without being echoed to `set_topic`. Volume notifications are debounced: each volume event restarts a one-second timer, and only the latest value is published after one second without another event. Invalid payloads are ignored. The MQTT connection automatically reconnects and restores the subscription after an interruption.
+Updates received on `read_topic` are reflected in Spotify Connect clients and the events API without being echoed to `set_topic`. Volume notifications are debounced: each volume event restarts a 500 ms timer, and only the latest value is published after 500 ms without another event. Invalid payloads are ignored. The MQTT connection automatically reconnects and restores the subscription after an interruption.
 
 ### Additional configuration
 
