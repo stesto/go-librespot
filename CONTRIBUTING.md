@@ -40,3 +40,18 @@ occur after disposal. The error-delivery test also runs without an audio device.
 These tests do not need Spotify credentials. They verify the local audio queue,
 not audible output or successful Spotify authentication, licensing, or track
 playback. Report those separately when validating end-to-end playback.
+
+## Testing PulseAudio volume
+
+The PulseAudio volume regression test requires a dedicated server with a
+`module-null-sink` sink and `module-stream-restore` enabled. It changes stream
+volumes, so use an isolated server rather than your desktop's audio server:
+
+```sh
+GO_LIBRESPOT_TEST_PULSE_SERVER=unix:/path/to/test-pulse.sock \
+  go test -tags test_integration ./output -run TestPulseAudioVolume -v
+```
+
+This checks mono and stereo streams with external volume enabled and disabled,
+including startup notifications, Spotify volume requests, mixer changes, and
+reopening after a saved attenuated stream volume.

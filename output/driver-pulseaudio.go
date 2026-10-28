@@ -19,6 +19,7 @@ type pulseAudioOutput struct {
 	stream               *pulse.PlaybackStream
 	volume               proto.Volume
 	volumeLock           sync.Mutex
+	externalVolume       bool
 	externalVolumeUpdate chan float32
 	err                  chan error
 }
@@ -43,6 +44,7 @@ func newPulseAudioOutput(opts *NewOutputOptions) (*pulseAudioOutput, error) {
 		sampleRate:           opts.SampleRate,
 		reader:               opts.Reader,
 		client:               client,
+		externalVolume:       opts.ExternalVolume,
 		externalVolumeUpdate: opts.VolumeUpdate,
 		err:                  make(chan error, 2),
 	}
@@ -62,6 +64,20 @@ func newPulseAudioOutput(opts *NewOutputOptions) (*pulseAudioOutput, error) {
 		pulse.PlaybackSampleRate(out.sampleRate),
 		pulse.PlaybackVolumeChanges(volumeUpdates),
 		channelOpt,
+	}
+	if opts.ExternalVolume {
+		// The external controller owns the listening level. Explicitly bypass
+		// any saved PulseAudio stream attenuation, without reporting unity as
+		// a volume command to that controller.
+		lplaybackopts = append(lplaybackopts, pulse.PlaybackRawOption(func(req *proto.CreatePlaybackStream) {
+			req.ChannelVolumes = make(proto.ChannelVolumes, opts.ChannelCount)
+			for i := range req.ChannelVolumes {
+				req.ChannelVolumes[i] = proto.NormVolume(1)
+			}
+			req.VolumeSet = true
+			// Keep unity relative to the sink, including with flat volumes.
+			req.RelativeVolume = true
+		}))
 	}
 
 	if opts.Device != "" {
@@ -85,18 +101,25 @@ func newPulseAudioOutput(opts *NewOutputOptions) (*pulseAudioOutput, error) {
 		return nil, err
 	}
 
-	// Read the initial volume from PulseAudio.
+	// When PulseAudio controls the listening level, read its initial volume.
 	// PulseAudio strongly recommends against setting a default volume at
 	// startup (especially if it's 100%), so instead we just follow the
 	// PulseAudio provided volume.
-	cvol, _ := out.stream.Volume()
-	out.volume = cvol.Avg()
-	sendVolumeUpdate(opts.VolumeUpdate, float32(out.volume.Norm()))
+	if !out.externalVolume {
+		cvol, _ := out.stream.Volume()
+		out.volume = cvol.Avg()
+		sendVolumeUpdate(opts.VolumeUpdate, float32(out.volume.Norm()))
+	}
 
 	// Listen for volume changes (through the volume mixer application, usually
 	// built into the desktop environment), and send them back to Spotify.
 	go func() {
 		for cvol := range volumeUpdates {
+			if out.externalVolume {
+				// PulseAudio's stream level is independent of the external
+				// listening level and must never be sent to the controller.
+				continue
+			}
 			volume := cvol.Avg()
 
 			out.volumeLock.Lock()
@@ -184,6 +207,11 @@ func (out *pulseAudioOutput) DelayMs() (int64, error) {
 }
 
 func (out *pulseAudioOutput) SetVolume(vol float32) {
+	if out.externalVolume {
+		// The daemon forwards this request to the external controller.
+		// Leave the playback stream at unity gain.
+		return
+	}
 	volume := proto.NormVolume(float64(vol))
 
 	out.volumeLock.Lock()

@@ -293,6 +293,8 @@ volume_over_mqtt:
   set_topic: minidsp_dev/911111/Master/Volume/set
 ```
 
+With `audio_backend: pulseaudio` and `external_volume: true`, the playback stream starts at unity gain (0 dB). Spotify volume changes control MQTT without attenuating the stream. PulseAudio's initial stream volume and mixer changes are not forwarded to MQTT. Without external volume, PulseAudio retains its normal mixer behavior. Track normalization and `normalisation_pregain` still apply independently.
+
 Payloads are plain-text percentage numbers between `0` and `100`. Incoming values may include decimals (for example, `37.5`); outgoing set commands are rounded to the nearest integer. These percentages are independent of `volume_steps`.
 
 go-librespot subscribes to `read_topic` for the current/acknowledged volume. Publish the current value as a **retained** message so it is available immediately when go-librespot starts or reconnects. MQTT has no request to fetch a topic's value: without a retained value, go-librespot waits for the next update and uses `initial_volume` until one arrives.

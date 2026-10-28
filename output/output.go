@@ -89,13 +89,13 @@ type NewOutputOptions struct {
 	// InitialVolume specifies the initial output volume.
 	//
 	// This is supported on the alsa, pipe, audio-toolbox, and wasapi backends. The PulseAudio
-	// backend uses the PulseAudio default volume.
+	// backend uses the PulseAudio default volume unless ExternalVolume is set.
 	InitialVolume float32
 
 	// ExternalVolume specifies, if the volume is controlled outside the app.
 	//
-	// This is only supported on the alsa and pipe backends.
-	// The PulseAudio backend always uses external volume.
+	// Supported on the alsa, pipe, pulseaudio, and wasapi backends. PulseAudio
+	// uses unity stream gain and does not report its mixer volume in this mode.
 	ExternalVolume bool
 
 	// VolumeUpdate is a channel on which volume updates will be sent back to

@@ -172,8 +172,8 @@ type Options struct {
 
 	// ExternalVolume specifies, if the volume is controlled outside the app.
 	//
-	// This is only supported on the alsa and pipe backends.
-	// The PulseAudio backend always uses external volume.
+	// Supported on the alsa, pipe, pulseaudio, and wasapi backends. PulseAudio
+	// uses unity stream gain and does not report its mixer volume in this mode.
 	ExternalVolume bool
 
 	// VolumeUpdate is a channel on which volume updates will be sent back to
